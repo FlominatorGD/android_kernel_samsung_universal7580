@@ -20,7 +20,6 @@
 #include <linux/uio.h>
 #include <linux/audit.h>
 #include <linux/pid_namespace.h>
-#include <linux/user_namespace.h>
 #include <linux/syscalls.h>
 #include <linux/uaccess.h>
 #include <linux/regset.h>
@@ -35,17 +34,24 @@ static int ptrace_trapping_sleep_fn(void *flags)
 	return 0;
 }
 
+void __ptrace_link(struct task_struct *child, struct task_struct *new_parent,
+		   const struct cred *ptracer_cred)
+{
+	BUG_ON(!list_empty(&child->ptrace_entry));
+	list_add(&child->ptrace_entry, &new_parent->ptraced);
+	child->parent = new_parent;
+	child->ptracer_cred = get_cred(ptracer_cred);
+}
+
 /*
  * ptrace a task: make the debugger its new parent and
  * move it to the ptrace list.
  *
  * Must be called with the tasklist lock write-held.
  */
-void __ptrace_link(struct task_struct *child, struct task_struct *new_parent)
+static void ptrace_link(struct task_struct *child, struct task_struct *new_parent)
 {
-	BUG_ON(!list_empty(&child->ptrace_entry));
-	list_add(&child->ptrace_entry, &new_parent->ptraced);
-	child->parent = new_parent;
+	__ptrace_link(child, new_parent, current_cred());
 }
 
 /**
@@ -78,11 +84,15 @@ void __ptrace_link(struct task_struct *child, struct task_struct *new_parent)
  */
 void __ptrace_unlink(struct task_struct *child)
 {
+	const struct cred *old_cred;
 	BUG_ON(!child->ptrace);
 
 	child->ptrace = 0;
 	child->parent = child->real_parent;
 	list_del_init(&child->ptrace_entry);
+	old_cred = child->ptracer_cred;
+	child->ptracer_cred = NULL;
+	put_cred(old_cred);
 
 	spin_lock(&child->sighand->siglock);
 
@@ -220,39 +230,19 @@ static int ptrace_check_attach(struct task_struct *child, bool ignore_state)
 	return ret;
 }
 
-static bool ptrace_has_cap(const struct cred *tcred, unsigned int mode)
+static int ptrace_has_cap(struct user_namespace *ns, unsigned int mode)
 {
-	struct user_namespace *tns = tcred->user_ns;
-	/* When a root-owned process enters a user namespace created by a
-	 * malicious user, the user shouldn't be able to execute code under
-	 * uid 0 by attaching to the root-owned process via ptrace.
-	 * Therefore, similar to the capable_wrt_inode_uidgid() check,
-	 * verify that all the uids and gids of the target process are
-	 * mapped into a namespace below the current one in which the caller
-	 * is capable.+	 * No fsuid/fsgid check because __ptrace_may_access doesn't do it
-	 * either.
-	 */
-	while (
-	    !kuid_has_mapping(tns, tcred->euid) ||
-	    !kuid_has_mapping(tns, tcred->suid) ||
-	    !kuid_has_mapping(tns, tcred->uid)  ||
-	    !kgid_has_mapping(tns, tcred->egid) ||
-	    !kgid_has_mapping(tns, tcred->sgid) ||
-	    !kgid_has_mapping(tns, tcred->gid)) {
-		tns = tns->parent;
-	}
-
 	if (mode & PTRACE_MODE_NOAUDIT)
-		return has_ns_capability_noaudit(current, tns, CAP_SYS_PTRACE);
+		return has_ns_capability_noaudit(current, ns, CAP_SYS_PTRACE);
 	else
-		return has_ns_capability(current, tns, CAP_SYS_PTRACE);
+		return has_ns_capability(current, ns, CAP_SYS_PTRACE);
 }
 
 /* Returns 0 on success, -errno on denial. */
 static int __ptrace_may_access(struct task_struct *task, unsigned int mode)
 {
 	const struct cred *cred = current_cred(), *tcred;
-	int dumpable = 0;
+	struct mm_struct *mm;
 	kuid_t caller_uid;
 	kgid_t caller_gid;
 
@@ -297,22 +287,17 @@ static int __ptrace_may_access(struct task_struct *task, unsigned int mode)
 	    gid_eq(caller_gid, tcred->sgid) &&
 	    gid_eq(caller_gid, tcred->gid))
 		goto ok;
-	if (ptrace_has_cap(tcred, mode))
+	if (ptrace_has_cap(tcred->user_ns, mode))
 		goto ok;
 	rcu_read_unlock();
 	return -EPERM;
 ok:
 	rcu_read_unlock();
-	smp_rmb();
-	if (task->mm)
-		dumpable = get_dumpable(task->mm);
-	rcu_read_lock();
-	if (dumpable != SUID_DUMP_USER &&
-	    !ptrace_has_cap(__task_cred(task), mode)) {
-		rcu_read_unlock();
-		return -EPERM;
-	}
-	rcu_read_unlock();
+	mm = task->mm;
+	if (mm &&
+	    ((get_dumpable(mm) != SUID_DUMP_USER) &&
+	     !ptrace_has_cap(mm->user_ns, mode)))
+	    return -EPERM;
 
 	return security_ptrace_access_check(task, mode);
 }
@@ -376,13 +361,9 @@ static int ptrace_attach(struct task_struct *task, long request,
 
 	if (seize)
 		flags |= PT_SEIZED;
-	rcu_read_lock();
-	if (ns_capable(__task_cred(task)->user_ns, CAP_SYS_PTRACE))
-		flags |= PT_PTRACE_CAP;
-	rcu_read_unlock();
 	task->ptrace = flags;
 
-	__ptrace_link(task, current);
+	ptrace_link(task, current);
 
 	/* SEIZE doesn't trap tracee on attach */
 	if (!seize)
@@ -449,7 +430,7 @@ static int ptrace_traceme(void)
 		 */
 		if (!ret && !(current->real_parent->flags & PF_EXITING)) {
 			current->ptrace = PT_PTRACED;
-			__ptrace_link(current, current->real_parent);
+			ptrace_link(current, current->real_parent);
 		}
 	}
 	write_unlock_irq(&tasklist_lock);
@@ -691,6 +672,10 @@ static int ptrace_peek_siginfo(struct task_struct *child,
 	if (arg.nr < 0)
 		return -EINVAL;
 
+	/* Ensure arg.off fits in an unsigned long */
+	if (arg.off > ULONG_MAX)
+		return 0;
+
 	if (arg.flags & PTRACE_PEEKSIGINFO_SHARED)
 		pending = &child->signal->shared_pending;
 	else
@@ -698,18 +683,20 @@ static int ptrace_peek_siginfo(struct task_struct *child,
 
 	for (i = 0; i < arg.nr; ) {
 		siginfo_t info;
-		s32 off = arg.off + i;
+		unsigned long off = arg.off + i;
+		bool found = false;
 
 		spin_lock_irq(&child->sighand->siglock);
 		list_for_each_entry(q, &pending->list, list) {
 			if (!off--) {
+				found = true;
 				copy_siginfo(&info, &q->info);
 				break;
 			}
 		}
 		spin_unlock_irq(&child->sighand->siglock);
 
-		if (off >= 0) /* beyond the end of the list */
+		if (!found) /* beyond the end of the list */
 			break;
 
 #ifdef CONFIG_COMPAT
@@ -915,6 +902,47 @@ int ptrace_request(struct task_struct *child, long request,
 			ret = ptrace_setsiginfo(child, &siginfo);
 		break;
 
+	case PTRACE_GETSIGMASK:
+		if (addr != sizeof(sigset_t)) {
+			ret = -EINVAL;
+			break;
+		}
+
+		if (copy_to_user(datavp, &child->blocked, sizeof(sigset_t)))
+			ret = -EFAULT;
+		else
+			ret = 0;
+
+		break;
+
+	case PTRACE_SETSIGMASK: {
+		sigset_t new_set;
+
+		if (addr != sizeof(sigset_t)) {
+			ret = -EINVAL;
+			break;
+		}
+
+		if (copy_from_user(&new_set, datavp, sizeof(sigset_t))) {
+			ret = -EFAULT;
+			break;
+		}
+
+		sigdelsetmask(&new_set, sigmask(SIGKILL)|sigmask(SIGSTOP));
+
+		/*
+		 * Every thread does recalc_sigpending() after resume, so
+		 * retarget_shared_pending() and recalc_sigpending() are not
+		 * called here.
+		 */
+		spin_lock_irq(&child->sighand->siglock);
+		child->blocked = new_set;
+		spin_unlock_irq(&child->sighand->siglock);
+
+		ret = 0;
+		break;
+	}
+
 	case PTRACE_INTERRUPT:
 		/*
 		 * Stop tracee without any side-effect on signal or job
@@ -1019,8 +1047,7 @@ int ptrace_request(struct task_struct *child, long request,
 
 #ifdef CONFIG_HAVE_ARCH_TRACEHOOK
 	case PTRACE_GETREGSET:
-	case PTRACE_SETREGSET:
-	{
+	case PTRACE_SETREGSET: {
 		struct iovec kiov;
 		struct iovec __user *uiov = datavp;
 
@@ -1210,8 +1237,8 @@ int compat_ptrace_request(struct task_struct *child, compat_long_t request,
 	return ret;
 }
 
-asmlinkage long compat_sys_ptrace(compat_long_t request, compat_long_t pid,
-				  compat_long_t addr, compat_long_t data)
+COMPAT_SYSCALL_DEFINE4(ptrace, compat_long_t, request, compat_long_t, pid,
+		       compat_long_t, addr, compat_long_t, data)
 {
 	struct task_struct *child;
 	long ret;

@@ -116,18 +116,14 @@ void blk_queue_congestion_threshold(struct request_queue *q)
  * @bdev:	device
  *
  * Locates the passed device's request queue and returns the address of its
- * backing_dev_info
- *
- * Will return NULL if the request queue cannot be located.
+ * backing_dev_info.  This function can only be called if @bdev is opened
+ * and the return value is never NULL.
  */
 struct backing_dev_info *blk_get_backing_dev_info(struct block_device *bdev)
 {
-	struct backing_dev_info *ret = NULL;
 	struct request_queue *q = bdev_get_queue(bdev);
 
-	if (q)
-		ret = &q->backing_dev_info;
-	return ret;
+	return &q->backing_dev_info;
 }
 EXPORT_SYMBOL(blk_get_backing_dev_info);
 
@@ -145,7 +141,6 @@ void blk_rq_init(struct request_queue *q, struct request *rq)
 	rq->cmd = rq->__cmd;
 	rq->cmd_len = BLK_MAX_CDB;
 	rq->tag = -1;
-	rq->ref_count = 1;
 	rq->start_time = jiffies;
 	set_start_time_ns(rq);
 	rq->part = NULL;
@@ -174,9 +169,9 @@ void blk_dump_rq_flags(struct request *rq, char *msg)
 {
 	int bit;
 
-	printk(KERN_INFO "%s: dev %s: type=%x, flags=%x\n", msg,
+	printk(KERN_INFO "%s: dev %s: type=%x, flags=%llx\n", msg,
 		rq->rq_disk ? rq->rq_disk->disk_name : "?", rq->cmd_type,
-		rq->cmd_flags);
+		(unsigned long long) rq->cmd_flags);
 
 	printk(KERN_INFO "  sector %llu, nr/cnr %u/%u\n",
 	       (unsigned long long)blk_rq_pos(rq),
@@ -1282,8 +1277,6 @@ void __blk_put_request(struct request_queue *q, struct request *req)
 {
 	if (unlikely(!q))
 		return;
-	if (unlikely(--req->ref_count))
-		return;
 
 	blk_pm_put_request(req);
 
@@ -2036,8 +2029,6 @@ static void blk_account_io_completion(struct request *req, unsigned int bytes)
 		cpu = part_stat_lock();
 		part = req->part;
 		part_stat_add(cpu, part, sectors[rw], bytes >> 9);
-		if (req->cmd_flags & REQ_DISCARD)
-			part_stat_add(cpu, part, discard_sectors, bytes >> 9);
 		part_stat_unlock();
 	}
 }
@@ -2062,17 +2053,10 @@ static void blk_account_io_done(struct request *req)
 		part_stat_add(cpu, part, ticks[rw], duration);
 		part_round_stats(cpu, part);
 		part_dec_in_flight(part, rw);
-		if (req->cmd_flags & REQ_DISCARD)
-			part_stat_inc(cpu, part, discard_ios);
-		if (!(req->cmd_flags & REQ_STARTED))
-			part_stat_inc(cpu, part, flush_ios);
 
 		hd_struct_put(part);
 		part_stat_unlock();
 	}
-
-	if (req->cmd_flags & REQ_FLUSH_SEQ)
-		req->q->flush_ios++;
 }
 
 #ifdef CONFIG_PM_RUNTIME
@@ -2217,8 +2201,6 @@ void blk_dequeue_request(struct request *rq)
 	 * the driver side.
 	 */
 	if (blk_account_rq(rq)) {
-		if (!queue_in_flight(q))
-			q->in_flight_stamp = ktime_get();
 		q->in_flight[rq_is_sync(rq)]++;
 		set_io_start_time_ns(rq);
 	}
@@ -3214,8 +3196,7 @@ int __init blk_dev_init(void)
 
 	/* used for unplugging and affects IO latency/throughput - HIGHPRI */
 	kblockd_workqueue = alloc_workqueue("kblockd",
-					    WQ_MEM_RECLAIM | WQ_HIGHPRI |
-					    WQ_POWER_EFFICIENT, 0);
+					    WQ_MEM_RECLAIM | WQ_HIGHPRI, 0);
 	if (!kblockd_workqueue)
 		panic("Failed to create kblockd\n");
 

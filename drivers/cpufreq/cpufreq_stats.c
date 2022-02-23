@@ -29,7 +29,7 @@
 #include <linux/profile.h>
 #include <linux/sched.h>
 #include <linux/seq_file.h>
-#include <asm/cputime.h>
+#include <linux/cputime.h>
 #ifdef CONFIG_BL_SWITCHER
 #include <asm/bL_switcher.h>
 #endif
@@ -56,7 +56,7 @@ struct uid_entry {
 struct cpufreq_stats {
 	unsigned int cpu;
 	unsigned int total_trans;
-	unsigned long long  last_time;
+	unsigned long long last_time;
 	unsigned int max_state;
 	unsigned int state_num;
 	atomic_t cpu_freq_i;
@@ -496,7 +496,7 @@ static ssize_t show_trans_table(struct cpufreq_policy *policy, char *buf)
 		len += snprintf(buf + len, PAGE_SIZE - len, "%9u: ",
 				stat->freq_table[i]);
 
-		for (j = 0; j < stat->state_num; j++)   {
+		for (j = 0; j < stat->state_num; j++) {
 			if (len >= PAGE_SIZE)
 				break;
 			len += snprintf(buf + len, PAGE_SIZE - len, "%9u ",
@@ -893,27 +893,6 @@ static void cpufreq_allstats_create(unsigned int cpu,
 	all_stat->state_num = j;
 	per_cpu(all_cpufreq_stats, cpu) = all_stat;
 	spin_unlock(&cpufreq_stats_lock);
-}
-
-void cpufreq_task_stats_remove_uids(uid_t uid_start, uid_t uid_end)
-{
-	struct uid_entry *uid_entry;
-	struct hlist_node *tmp;
-
-	rt_mutex_lock(&uid_lock);
-
-	for (; uid_start <= uid_end; uid_start++) {
-		hash_for_each_possible_safe(uid_hash_table, uid_entry, tmp,
-			hash, uid_start) {
-			if (uid_start == uid_entry->uid) {
-				hash_del(&uid_entry->hash);
-				kfree(uid_entry->dead_time_in_state);
-				kfree(uid_entry);
-			}
-		}
-	}
-
-	rt_mutex_unlock(&uid_lock);
 }
 
 static int cpufreq_stat_notifier_policy(struct notifier_block *nb,

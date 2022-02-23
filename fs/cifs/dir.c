@@ -162,7 +162,7 @@ cifs_bp_rename_retry:
 
 		cifs_dbg(FYI, "using cifs_sb prepath <%s>\n", cifs_sb->prepath);
 		memcpy(full_path+dfsplen+1, cifs_sb->prepath, pplen-1);
-		full_path[dfsplen] = '\\';
+		full_path[dfsplen] = dirsep;
 		for (i = 0; i < pplen-1; i++)
 			if (full_path[dfsplen+1+i] == '/')
 				full_path[dfsplen+1+i] = CIFS_DIR_SEP(cifs_sb);
@@ -182,14 +182,20 @@ cifs_bp_rename_retry:
 }
 
 /*
+ * Don't allow path components longer than the server max.
  * Don't allow the separator character in a path component.
  * The VFS will not allow "/", but "\" is allowed by posix.
  */
 static int
-check_name(struct dentry *direntry)
+check_name(struct dentry *direntry, struct cifs_tcon *tcon)
 {
 	struct cifs_sb_info *cifs_sb = CIFS_SB(direntry->d_sb);
 	int i;
+
+	if (unlikely(tcon->fsAttrInfo.MaxPathNameComponentLength &&
+		     direntry->d_name.len >
+		     le32_to_cpu(tcon->fsAttrInfo.MaxPathNameComponentLength)))
+		return -ENAMETOOLONG;
 
 	if (!(cifs_sb->mnt_cifs_flags & CIFS_MOUNT_POSIX_PATHS)) {
 		for (i = 0; i < direntry->d_name.len; i++) {
@@ -481,10 +487,6 @@ cifs_atomic_open(struct inode *inode, struct dentry *direntry,
 		return finish_no_open(file, res);
 	}
 
-	rc = check_name(direntry);
-	if (rc)
-		return rc;
-
 	xid = get_xid();
 
 	cifs_dbg(FYI, "parent inode = 0x%p name is: %s and dentry = 0x%p\n",
@@ -497,6 +499,11 @@ cifs_atomic_open(struct inode *inode, struct dentry *direntry,
 	}
 
 	tcon = tlink_tcon(tlink);
+
+	rc = check_name(direntry, tcon);
+	if (rc)
+		goto out;
+
 	server = tcon->ses->server;
 
 	if (server->ops->new_lease_key)
@@ -739,7 +746,7 @@ cifs_lookup(struct inode *parent_dir_inode, struct dentry *direntry,
 	}
 	pTcon = tlink_tcon(tlink);
 
-	rc = check_name(direntry);
+	rc = check_name(direntry, pTcon);
 	if (rc)
 		goto lookup_out;
 
@@ -857,8 +864,7 @@ const struct dentry_operations cifs_dentry_ops = {
 /* d_delete:       cifs_d_delete,      */ /* not needed except for debugging */
 };
 
-static int cifs_ci_hash(const struct dentry *dentry, const struct inode *inode,
-		struct qstr *q)
+static int cifs_ci_hash(const struct dentry *dentry, struct qstr *q)
 {
 	struct nls_table *codepage = CIFS_SB(dentry->d_sb)->local_nls;
 	unsigned long hash;
@@ -873,12 +879,10 @@ static int cifs_ci_hash(const struct dentry *dentry, const struct inode *inode,
 	return 0;
 }
 
-static int cifs_ci_compare(const struct dentry *parent,
-		const struct inode *pinode,
-		const struct dentry *dentry, const struct inode *inode,
+static int cifs_ci_compare(const struct dentry *parent, const struct dentry *dentry,
 		unsigned int len, const char *str, const struct qstr *name)
 {
-	struct nls_table *codepage = CIFS_SB(pinode->i_sb)->local_nls;
+	struct nls_table *codepage = CIFS_SB(parent->d_sb)->local_nls;
 
 	if ((name->len == len) &&
 	    (nls_strnicmp(codepage, name->name, str, len) == 0))

@@ -28,12 +28,10 @@ struct dentry;
  * Bits in backing_dev_info.state
  */
 enum bdi_state {
-	BDI_wb_alloc,		/* Default embedded wb allocated */
 	BDI_async_congested,	/* The async (write) queue is getting full */
 	BDI_sync_congested,	/* The sync queue is getting full */
 	BDI_registered,		/* bdi_register() was done */
 	BDI_writeback_running,	/* Writeback is in progress */
-	BDI_unused,		/* Available bits start here */
 };
 
 typedef int (congested_fn)(void *, int);
@@ -50,7 +48,6 @@ enum bdi_stat_item {
 
 struct bdi_writeback {
 	struct backing_dev_info *bdi;	/* our parent bdi */
-	unsigned int nr;
 
 	unsigned long last_old_flush;	/* last old data flush */
 
@@ -64,6 +61,7 @@ struct bdi_writeback {
 struct backing_dev_info {
 	struct list_head bdi_list;
 	unsigned long ra_pages;	/* max readahead in PAGE_CACHE_SIZE units */
+	unsigned long io_pages;	/* max allowed IO size */
 	unsigned long state;	/* Always use atomic bitops on this */
 	unsigned int capabilities; /* Device capabilities */
 	congested_fn *congested_fn; /* Function pointer if device is md/dm */
@@ -90,10 +88,6 @@ struct backing_dev_info {
 
 	struct fprop_local_percpu completions;
 	int dirty_exceeded;
-	/* approximate write throttle statistics - updated at each throttling */
-	unsigned long last_thresh;  /* global/bdi thresh at the last throttle */
-	unsigned long last_nr_dirty; /* global/bdi dirty at the last throttle */
-	unsigned long paused_total; /* approximated sum of pauses. in jiffies */
 
 	unsigned int min_ratio;
 	unsigned int max_ratio, max_prop_frac;
@@ -128,7 +122,6 @@ void bdi_start_background_writeback(struct backing_dev_info *bdi);
 void bdi_writeback_workfn(struct work_struct *work);
 int bdi_has_dirty_io(struct backing_dev_info *bdi);
 void bdi_wakeup_thread_delayed(struct backing_dev_info *bdi);
-void bdi_lock_two(struct bdi_writeback *wb1, struct bdi_writeback *wb2);
 
 extern spinlock_t bdi_lock;
 extern struct list_head bdi_list;
@@ -247,6 +240,8 @@ int bdi_set_max_ratio(struct backing_dev_info *bdi, unsigned int max_ratio);
  * BDI_CAP_EXEC_MAP:       Can be mapped for execution
  *
  * BDI_CAP_SWAP_BACKED:    Count shmem/tmpfs objects as swap-backed.
+ *
+ * BDI_CAP_STRICTLIMIT:    Keep number of dirty pages below bdi threshold.
  */
 #define BDI_CAP_NO_ACCT_DIRTY	0x00000001
 #define BDI_CAP_NO_WRITEBACK	0x00000002
@@ -258,6 +253,7 @@ int bdi_set_max_ratio(struct backing_dev_info *bdi, unsigned int max_ratio);
 #define BDI_CAP_NO_ACCT_WB	0x00000080
 #define BDI_CAP_SWAP_BACKED	0x00000100
 #define BDI_CAP_STABLE_WRITES	0x00000200
+#define BDI_CAP_STRICTLIMIT	0x00000400
 
 #define BDI_CAP_VMFLAGS \
 	(BDI_CAP_READ_MAP | BDI_CAP_WRITE_MAP | BDI_CAP_EXEC_MAP)

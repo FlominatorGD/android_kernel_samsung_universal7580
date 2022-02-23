@@ -123,6 +123,7 @@ static int minix_remount (struct super_block * sb, int * flags, char * data)
 	struct minix_sb_info * sbi = minix_sb(sb);
 	struct minix_super_block * ms;
 
+	sync_filesystem(sb);
 	ms = sbi->s_ms;
 	if ((*flags & MS_RDONLY) == (sb->s_flags & MS_RDONLY))
 		return 0;
@@ -400,7 +401,7 @@ static void minix_write_failed(struct address_space *mapping, loff_t to)
 	struct inode *inode = mapping->host;
 
 	if (to > inode->i_size) {
-		truncate_pagecache(inode, to, inode->i_size);
+		truncate_pagecache(inode, inode->i_size);
 		minix_truncate(inode);
 	}
 }

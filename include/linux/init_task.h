@@ -14,6 +14,8 @@
 #include <net/net_namespace.h>
 #include <linux/sched/rt.h>
 
+#include <asm/thread_info.h>
+
 #ifdef CONFIG_SMP
 # define INIT_PUSHABLE_TASKS(tsk)					\
 	.pushable_tasks = PLIST_NODE_INIT(tsk.pushable_tasks, MAX_PRIO),
@@ -32,10 +34,10 @@ extern struct fs_struct init_fs;
 #endif
 
 #ifdef CONFIG_CPUSETS
-#define INIT_CPUSET_SEQ							\
-	.mems_allowed_seq = SEQCNT_ZERO,
+#define INIT_CPUSET_SEQ(tsk)							\
+	.mems_allowed_seq = SEQCNT_ZERO(tsk.mems_allowed_seq),
 #else
-#define INIT_CPUSET_SEQ
+#define INIT_CPUSET_SEQ(tsk)
 #endif
 
 #define INIT_SIGNALS(sig) {						\
@@ -155,12 +157,19 @@ extern struct task_group root_task_group;
 
 #define INIT_TASK_COMM "swapper"
 
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+# define INIT_TASK_TI(tsk) .thread_info = INIT_THREAD_INFO(tsk),
+#else
+# define INIT_TASK_TI(tsk)
+#endif
+
 /*
  *  INIT_TASK is used to set up the first task table, touch at
  * your own risk!. Base=0, limit=0x1fffff (=2MB)
  */
 #define INIT_TASK(tsk)	\
 {									\
+	INIT_TASK_TI(tsk)						\
 	.state		= 0,						\
 	.stack		= &init_thread_info,				\
 	.usage		= ATOMIC_INIT(2),				\
@@ -222,7 +231,7 @@ extern struct task_group root_task_group;
 	INIT_FTRACE_GRAPH						\
 	INIT_TRACE_RECURSION						\
 	INIT_TASK_RCU_PREEMPT(tsk)					\
-	INIT_CPUSET_SEQ							\
+	INIT_CPUSET_SEQ(tsk)						\
 	INIT_VTIME(tsk)							\
 }
 

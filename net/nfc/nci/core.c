@@ -116,12 +116,15 @@ static inline int nci_request(struct nci_dev *ndev,
 {
 	int rc;
 
-	if (!test_bit(NCI_UP, &ndev->flags))
-		return -ENETDOWN;
-
 	/* Serialize all requests */
 	mutex_lock(&ndev->req_lock);
-	rc = __nci_request(ndev, req, opt, timeout);
+	/* check the state after obtaing the lock against any races
+	 * from nci_close_device when the device gets removed.
+	 */
+	if (test_bit(NCI_UP, &ndev->flags))
+		rc = __nci_request(ndev, req, opt, timeout);
+	else
+		rc = -ENETDOWN;
 	mutex_unlock(&ndev->req_lock);
 
 	return rc;
@@ -413,8 +416,6 @@ static int nci_set_local_general_bytes(struct nfc_dev *nfc_dev)
 {
 	struct nci_dev *ndev = nfc_get_drvdata(nfc_dev);
 	struct nci_set_config_param param;
-	__u8 local_gb[NFC_MAX_GT_LEN];
-	int i;
 
 	param.val = nfc_get_local_general_bytes(nfc_dev, &param.len);
 	if ((param.val == NULL) || (param.len == 0))
@@ -423,11 +424,7 @@ static int nci_set_local_general_bytes(struct nfc_dev *nfc_dev)
 	if (param.len > NFC_MAX_GT_LEN)
 		return -EINVAL;
 
-	for (i = 0; i < param.len; i++)
-		local_gb[param.len-1-i] = param.val[i];
-
 	param.id = NCI_PN_ATR_REQ_GEN_BYTES;
-	param.val = local_gb;
 
 	return nci_request(ndev, nci_set_config_req, (unsigned long)&param,
 			   msecs_to_jiffies(NCI_SET_CONFIG_TIMEOUT));
@@ -720,10 +717,6 @@ int nci_register_device(struct nci_dev *ndev)
 	struct device *dev = &ndev->nfc_dev->dev;
 	char name[32];
 
-	rc = nfc_register_device(ndev->nfc_dev);
-	if (rc)
-		goto exit;
-
 	ndev->flags = 0;
 
 	INIT_WORK(&ndev->cmd_work, nci_cmd_work);
@@ -731,7 +724,7 @@ int nci_register_device(struct nci_dev *ndev)
 	ndev->cmd_wq = create_singlethread_workqueue(name);
 	if (!ndev->cmd_wq) {
 		rc = -ENOMEM;
-		goto unreg_exit;
+		goto exit;
 	}
 
 	INIT_WORK(&ndev->rx_work, nci_rx_work);
@@ -761,6 +754,10 @@ int nci_register_device(struct nci_dev *ndev)
 
 	mutex_init(&ndev->req_lock);
 
+	rc = nfc_register_device(ndev->nfc_dev);
+	if (rc)
+		goto destroy_rx_wq_exit;
+
 	goto exit;
 
 destroy_rx_wq_exit:
@@ -768,9 +765,6 @@ destroy_rx_wq_exit:
 
 destroy_cmd_wq_exit:
 	destroy_workqueue(ndev->cmd_wq);
-
-unreg_exit:
-	nfc_unregister_device(ndev->nfc_dev);
 
 exit:
 	return rc;
@@ -797,12 +791,11 @@ EXPORT_SYMBOL(nci_unregister_device);
 /**
  * nci_recv_frame - receive frame from NCI drivers
  *
+ * @ndev: The nci device
  * @skb: The sk_buff to receive
  */
-int nci_recv_frame(struct sk_buff *skb)
+int nci_recv_frame(struct nci_dev *ndev, struct sk_buff *skb)
 {
-	struct nci_dev *ndev = (struct nci_dev *) skb->dev;
-
 	pr_debug("len %d\n", skb->len);
 
 	if (!ndev || (!test_bit(NCI_UP, &ndev->flags) &&
@@ -819,10 +812,8 @@ int nci_recv_frame(struct sk_buff *skb)
 }
 EXPORT_SYMBOL(nci_recv_frame);
 
-static int nci_send_frame(struct sk_buff *skb)
+static int nci_send_frame(struct nci_dev *ndev, struct sk_buff *skb)
 {
-	struct nci_dev *ndev = (struct nci_dev *) skb->dev;
-
 	pr_debug("len %d\n", skb->len);
 
 	if (!ndev) {
@@ -833,7 +824,7 @@ static int nci_send_frame(struct sk_buff *skb)
 	/* Get rid of skb owner, prior to sending to the driver. */
 	skb_orphan(skb);
 
-	return ndev->ops->send(skb);
+	return ndev->ops->send(ndev, skb);
 }
 
 /* Send NCI command */
@@ -860,8 +851,6 @@ int nci_send_cmd(struct nci_dev *ndev, __u16 opcode, __u8 plen, void *payload)
 
 	if (plen)
 		memcpy(skb_put(skb, plen), payload, plen);
-
-	skb->dev = (void *) ndev;
 
 	skb_queue_tail(&ndev->cmd_q, skb);
 	queue_work(ndev->cmd_wq, &ndev->cmd_work);
@@ -894,7 +883,7 @@ static void nci_tx_work(struct work_struct *work)
 			 nci_conn_id(skb->data),
 			 nci_plen(skb->data));
 
-		nci_send_frame(skb);
+		nci_send_frame(ndev, skb);
 
 		mod_timer(&ndev->data_timer,
 			  jiffies + msecs_to_jiffies(NCI_DATA_TIMEOUT));
@@ -963,7 +952,7 @@ static void nci_cmd_work(struct work_struct *work)
 			 nci_opcode_oid(nci_opcode(skb->data)),
 			 nci_plen(skb->data));
 
-		nci_send_frame(skb);
+		nci_send_frame(ndev, skb);
 
 		mod_timer(&ndev->cmd_timer,
 			  jiffies + msecs_to_jiffies(NCI_CMD_TIMEOUT));

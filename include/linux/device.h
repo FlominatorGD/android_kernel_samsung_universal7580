@@ -48,7 +48,11 @@ struct bus_attribute {
 };
 
 #define BUS_ATTR(_name, _mode, _show, _store)	\
-struct bus_attribute bus_attr_##_name = __ATTR(_name, _mode, _show, _store)
+	struct bus_attribute bus_attr_##_name = __ATTR(_name, _mode, _show, _store)
+#define BUS_ATTR_RW(_name) \
+	struct bus_attribute bus_attr_##_name = __ATTR_RW(_name)
+#define BUS_ATTR_RO(_name) \
+	struct bus_attribute bus_attr_##_name = __ATTR_RO(_name)
 
 extern int __must_check bus_create_file(struct bus_type *,
 					struct bus_attribute *);
@@ -63,6 +67,9 @@ extern void bus_remove_file(struct bus_type *, struct bus_attribute *);
  * @bus_attrs:	Default attributes of the bus.
  * @dev_attrs:	Default attributes of the devices on the bus.
  * @drv_attrs:	Default attributes of the device drivers on the bus.
+ * @bus_groups:	Default attributes of the bus.
+ * @dev_groups:	Default attributes of the devices on the bus.
+ * @drv_groups: Default attributes of the device drivers on the bus.
  * @match:	Called, perhaps multiple times, whenever a new device or driver
  *		is added for this bus. It should return a nonzero value if the
  *		given device can be handled by the given driver.
@@ -95,9 +102,12 @@ struct bus_type {
 	const char		*name;
 	const char		*dev_name;
 	struct device		*dev_root;
-	struct bus_attribute	*bus_attrs;
-	struct device_attribute	*dev_attrs;
-	struct driver_attribute	*drv_attrs;
+	struct bus_attribute	*bus_attrs;	/* use bus_groups instead */
+	struct device_attribute	*dev_attrs;	/* use dev_groups instead */
+	struct driver_attribute	*drv_attrs;	/* use drv_groups instead */
+	const struct attribute_group **bus_groups;
+	const struct attribute_group **dev_groups;
+	const struct attribute_group **drv_groups;
 
 	int (*match)(struct device *dev, struct device_driver *drv);
 	int (*uevent)(struct device *dev, struct kobj_uevent_env *env);
@@ -254,9 +264,14 @@ struct driver_attribute {
 			 size_t count);
 };
 
-#define DRIVER_ATTR(_name, _mode, _show, _store)	\
-struct driver_attribute driver_attr_##_name =		\
-	__ATTR(_name, _mode, _show, _store)
+#define DRIVER_ATTR(_name, _mode, _show, _store) \
+	struct driver_attribute driver_attr_##_name = __ATTR(_name, _mode, _show, _store)
+#define DRIVER_ATTR_RW(_name) \
+	struct driver_attribute driver_attr_##_name = __ATTR_RW(_name)
+#define DRIVER_ATTR_RO(_name) \
+	struct driver_attribute driver_attr_##_name = __ATTR_RO(_name)
+#define DRIVER_ATTR_WO(_name) \
+	struct driver_attribute driver_attr_##_name = __ATTR_WO(_name)
 
 extern int __must_check driver_create_file(struct device_driver *driver,
 					const struct driver_attribute *attr);
@@ -407,8 +422,12 @@ struct class_attribute {
 				 const struct class_attribute *attr);
 };
 
-#define CLASS_ATTR(_name, _mode, _show, _store)			\
-struct class_attribute class_attr_##_name = __ATTR(_name, _mode, _show, _store)
+#define CLASS_ATTR(_name, _mode, _show, _store) \
+	struct class_attribute class_attr_##_name = __ATTR(_name, _mode, _show, _store)
+#define CLASS_ATTR_RW(_name) \
+	struct class_attribute class_attr_##_name = __ATTR_RW(_name)
+#define CLASS_ATTR_RO(_name) \
+	struct class_attribute class_attr_##_name = __ATTR_RO(_name)
 
 extern int __must_check class_create_file(struct class *class,
 					  const struct class_attribute *attr);
@@ -416,7 +435,6 @@ extern void class_remove_file(struct class *class,
 			      const struct class_attribute *attr);
 
 /* Simple class attribute that is just a static string */
-
 struct class_attribute_string {
 	struct class_attribute attr;
 	char *str;

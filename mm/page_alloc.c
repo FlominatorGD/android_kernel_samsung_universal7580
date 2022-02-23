@@ -110,19 +110,6 @@ unsigned long totalreserve_pages __read_mostly;
  */
 unsigned long dirty_balance_reserve __read_mostly;
 
-static unsigned int boot_mode = 0;
-static int __init setup_bootmode(char *str)
-{
-	printk("%s: boot_mode is %u\n", __func__, boot_mode);
-	if (get_option(&str, &boot_mode)) {
-		printk("%s: boot_mode is %u\n", __func__, boot_mode);
-		return 0;
-	}
-
-	return -EINVAL;
-}
-early_param("bootmode", setup_bootmode);
-
 int percpu_pagelist_fraction;
 gfp_t gfp_allowed_mask __read_mostly = GFP_BOOT_MASK;
 
@@ -2491,9 +2478,6 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
 	bool sync_migration = false;
 	bool deferred_compaction = false;
 	bool contended_compaction = false;
-#ifdef CONFIG_SEC_OOM_KILLER
-	unsigned long oom_invoke_timeout = jiffies + HZ/4;
-#endif
 
 	/*
 	 * In the slowpath, we sanity check order to avoid ever trying to
@@ -2505,10 +2489,6 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
 		WARN_ON_ONCE(!(gfp_mask & __GFP_NOWARN));
 		return NULL;
 	}
-
-#if defined(CONFIG_ARM) || defined(CONFIG_ARM64)
-	set_tsk_thread_flag(current, TIF_MEMALLOC);
-#endif
 
 	/*
 	 * GFP_THISNODE (meaning __GFP_THISNODE, __GFP_NORETRY and
@@ -2557,8 +2537,6 @@ rebalance:
 		 * the allocation is high priority and these type of
 		 * allocations are system rather than user orientated
 		 */
-		zonelist = node_zonelist(numa_node_id(), gfp_mask);
-
 		page = __alloc_pages_high_priority(gfp_mask, order,
 				zonelist, high_zoneidx, nodemask,
 				preferred_zone, migratetype);
@@ -2568,8 +2546,15 @@ rebalance:
 	}
 
 	/* Atomic allocations - we can't balance anything */
-	if (!wait)
+	if (!wait) {
+		/*
+		 * All existing users of the deprecated __GFP_NOFAIL are
+		 * blockable, so warn of any new users that actually allow this
+		 * type of allocation to fail.
+		 */
+		WARN_ON_ONCE(gfp_mask & __GFP_NOFAIL);
 		goto nopage;
+	}
 
 	/* Avoid recursion of direct reclaim */
 	if (current->flags & PF_MEMALLOC)
@@ -2617,16 +2602,8 @@ rebalance:
 	/*
 	 * If we failed to make any progress reclaiming, then we are
 	 * running out of options and have to consider going OOM
-	 * If we are looping more than 250 ms, go to OOM
 	 */
-
-#ifdef CONFIG_SEC_OOM_KILLER
-#define SHOULD_CONSIDER_OOM (!did_some_progress || time_after(jiffies, oom_invoke_timeout)) && (boot_mode != 2)
-#else
-#define SHOULD_CONSIDER_OOM !did_some_progress && (boot_mode != 2)
-#endif
-
-	if (SHOULD_CONSIDER_OOM) {
+	if (!did_some_progress) {
 		if ((gfp_mask & __GFP_FS) && !(gfp_mask & __GFP_NORETRY)) {
 			if (oom_killer_disabled)
 				goto nopage;
@@ -2634,13 +2611,6 @@ rebalance:
 			if ((current->flags & PF_DUMPCORE) &&
 			    !(gfp_mask & __GFP_NOFAIL))
 				goto nopage;
-
-#ifdef CONFIG_SEC_OOM_KILLER
-			if (did_some_progress)
-				pr_info("time's up : calling "
-					"__alloc_pages_may_oom(o:%u, gfp:0x%x)\n",
-								order, gfp_mask);
-#endif
 			page = __alloc_pages_may_oom(gfp_mask, order,
 					zonelist, high_zoneidx,
 					nodemask, preferred_zone,
@@ -2666,9 +2636,6 @@ rebalance:
 					goto nopage;
 			}
 
-#ifdef CONFIG_SEC_OOM_KILLER
-			oom_invoke_timeout = jiffies + HZ/4;
-#endif
 			goto restart;
 		}
 	}
@@ -2699,15 +2666,9 @@ rebalance:
 	}
 
 nopage:
-#if defined(CONFIG_ARM) || defined(CONFIG_ARM64)
-	clear_tsk_thread_flag(current, TIF_MEMALLOC);
-#endif
 	warn_alloc_failed(gfp_mask, order, NULL);
 	return page;
 got_pg:
-#if defined(CONFIG_ARM) || defined(CONFIG_ARM64)
-	clear_tsk_thread_flag(current, TIF_MEMALLOC);
-#endif
 	if (kmemcheck_enabled)
 		kmemcheck_pagealloc_alloc(page, order, gfp_mask);
 
@@ -3011,6 +2972,49 @@ static inline void show_node(struct zone *zone)
 		printk("Node %d ", zone_to_nid(zone));
 }
 
+long si_mem_available(void)
+{
+	long available;
+	unsigned long pagecache;
+	unsigned long wmark_low = 0;
+	unsigned long pages[NR_LRU_LISTS];
+	struct zone *zone;
+	int lru;
+
+	for (lru = LRU_BASE; lru < NR_LRU_LISTS; lru++)
+		pages[lru] = global_page_state(NR_LRU_BASE + lru);
+
+	for_each_zone(zone)
+		wmark_low += zone->watermark[WMARK_LOW];
+
+	/*
+	 * Estimate the amount of memory available for userspace allocations,
+	 * without causing swapping.
+	 */
+	available = global_page_state(NR_FREE_PAGES) - totalreserve_pages;
+
+	/*
+	 * Not all the page cache can be freed, otherwise the system will
+	 * start swapping. Assume at least half of the page cache, or the
+	 * low watermark worth of cache, needs to stay.
+	 */
+	pagecache = pages[LRU_ACTIVE_FILE] + pages[LRU_INACTIVE_FILE];
+	pagecache -= min(pagecache / 2, wmark_low);
+	available += pagecache;
+
+	/*
+	 * Part of the reclaimable slab consists of items that are in use,
+	 * and cannot be freed. Cap this estimate at the low watermark.
+	 */
+	available += global_page_state(NR_SLAB_RECLAIMABLE) -
+		     min(global_page_state(NR_SLAB_RECLAIMABLE) / 2, wmark_low);
+
+	if (available < 0)
+		available = 0;
+	return available;
+}
+EXPORT_SYMBOL_GPL(si_mem_available);
+
 void si_meminfo(struct sysinfo *val)
 {
 	val->totalram = totalram_pages;
@@ -3271,12 +3275,10 @@ static void zoneref_set_zone(struct zone *zone, struct zoneref *zoneref)
  * Add all populated zones of a node to the zonelist.
  */
 static int build_zonelists_node(pg_data_t *pgdat, struct zonelist *zonelist,
-				int nr_zones, enum zone_type zone_type)
+				int nr_zones)
 {
 	struct zone *zone;
-
-	BUG_ON(zone_type >= MAX_NR_ZONES);
-	zone_type++;
+	enum zone_type zone_type = MAX_NR_ZONES;
 
 	do {
 		zone_type--;
@@ -3286,8 +3288,8 @@ static int build_zonelists_node(pg_data_t *pgdat, struct zonelist *zonelist,
 				&zonelist->_zonerefs[nr_zones++]);
 			check_highest_zone(zone_type);
 		}
-
 	} while (zone_type);
+
 	return nr_zones;
 }
 
@@ -3474,8 +3476,7 @@ static void build_zonelists_in_node_order(pg_data_t *pgdat, int node)
 	zonelist = &pgdat->node_zonelists[0];
 	for (j = 0; zonelist->_zonerefs[j].zone != NULL; j++)
 		;
-	j = build_zonelists_node(NODE_DATA(node), zonelist, j,
-							MAX_NR_ZONES - 1);
+	j = build_zonelists_node(NODE_DATA(node), zonelist, j);
 	zonelist->_zonerefs[j].zone = NULL;
 	zonelist->_zonerefs[j].zone_idx = 0;
 }
@@ -3489,7 +3490,7 @@ static void build_thisnode_zonelists(pg_data_t *pgdat)
 	struct zonelist *zonelist;
 
 	zonelist = &pgdat->node_zonelists[1];
-	j = build_zonelists_node(pgdat, zonelist, 0, MAX_NR_ZONES - 1);
+	j = build_zonelists_node(pgdat, zonelist, 0);
 	zonelist->_zonerefs[j].zone = NULL;
 	zonelist->_zonerefs[j].zone_idx = 0;
 }
@@ -3697,7 +3698,7 @@ static void build_zonelists(pg_data_t *pgdat)
 	local_node = pgdat->node_id;
 
 	zonelist = &pgdat->node_zonelists[0];
-	j = build_zonelists_node(pgdat, zonelist, 0, MAX_NR_ZONES - 1);
+	j = build_zonelists_node(pgdat, zonelist, 0);
 
 	/*
 	 * Now we build the zonelist so that it contains the zones
@@ -3710,14 +3711,12 @@ static void build_zonelists(pg_data_t *pgdat)
 	for (node = local_node + 1; node < MAX_NUMNODES; node++) {
 		if (!node_online(node))
 			continue;
-		j = build_zonelists_node(NODE_DATA(node), zonelist, j,
-							MAX_NR_ZONES - 1);
+		j = build_zonelists_node(NODE_DATA(node), zonelist, j);
 	}
 	for (node = 0; node < local_node; node++) {
 		if (!node_online(node))
 			continue;
-		j = build_zonelists_node(NODE_DATA(node), zonelist, j,
-							MAX_NR_ZONES - 1);
+		j = build_zonelists_node(NODE_DATA(node), zonelist, j);
 	}
 
 	zonelist->_zonerefs[j].zone = NULL;
@@ -4489,13 +4488,13 @@ static void __meminit adjust_zone_range_for_zone_movable(int nid,
  */
 static unsigned long __meminit zone_spanned_pages_in_node(int nid,
 					unsigned long zone_type,
+					unsigned long node_start_pfn,
+					unsigned long node_end_pfn,
 					unsigned long *ignored)
 {
-	unsigned long node_start_pfn, node_end_pfn;
 	unsigned long zone_start_pfn, zone_end_pfn;
 
-	/* Get the start and end of the node and zone */
-	get_pfn_range_for_nid(nid, &node_start_pfn, &node_end_pfn);
+	/* Get the start and end of the zone */
 	zone_start_pfn = arch_zone_lowest_possible_pfn[zone_type];
 	zone_end_pfn = arch_zone_highest_possible_pfn[zone_type];
 	adjust_zone_range_for_zone_movable(nid, zone_type,
@@ -4550,14 +4549,14 @@ unsigned long __init absent_pages_in_range(unsigned long start_pfn,
 /* Return the number of page frames in holes in a zone on a node */
 static unsigned long __meminit zone_absent_pages_in_node(int nid,
 					unsigned long zone_type,
+					unsigned long node_start_pfn,
+					unsigned long node_end_pfn,
 					unsigned long *ignored)
 {
 	unsigned long zone_low = arch_zone_lowest_possible_pfn[zone_type];
 	unsigned long zone_high = arch_zone_highest_possible_pfn[zone_type];
-	unsigned long node_start_pfn, node_end_pfn;
 	unsigned long zone_start_pfn, zone_end_pfn;
 
-	get_pfn_range_for_nid(nid, &node_start_pfn, &node_end_pfn);
 	zone_start_pfn = clamp(node_start_pfn, zone_low, zone_high);
 	zone_end_pfn = clamp(node_end_pfn, zone_low, zone_high);
 
@@ -4570,6 +4569,8 @@ static unsigned long __meminit zone_absent_pages_in_node(int nid,
 #else /* CONFIG_HAVE_MEMBLOCK_NODE_MAP */
 static inline unsigned long __meminit zone_spanned_pages_in_node(int nid,
 					unsigned long zone_type,
+					unsigned long node_start_pfn,
+					unsigned long node_end_pfn,
 					unsigned long *zones_size)
 {
 	return zones_size[zone_type];
@@ -4577,6 +4578,8 @@ static inline unsigned long __meminit zone_spanned_pages_in_node(int nid,
 
 static inline unsigned long __meminit zone_absent_pages_in_node(int nid,
 						unsigned long zone_type,
+						unsigned long node_start_pfn,
+						unsigned long node_end_pfn,
 						unsigned long *zholes_size)
 {
 	if (!zholes_size)
@@ -4588,21 +4591,27 @@ static inline unsigned long __meminit zone_absent_pages_in_node(int nid,
 #endif /* CONFIG_HAVE_MEMBLOCK_NODE_MAP */
 
 static void __meminit calculate_node_totalpages(struct pglist_data *pgdat,
-		unsigned long *zones_size, unsigned long *zholes_size)
+						unsigned long node_start_pfn,
+						unsigned long node_end_pfn,
+						unsigned long *zones_size,
+						unsigned long *zholes_size)
 {
 	unsigned long realtotalpages, totalpages = 0;
 	enum zone_type i;
 
 	for (i = 0; i < MAX_NR_ZONES; i++)
 		totalpages += zone_spanned_pages_in_node(pgdat->node_id, i,
-								zones_size);
+							 node_start_pfn,
+							 node_end_pfn,
+							 zones_size);
 	pgdat->node_spanned_pages = totalpages;
 
 	realtotalpages = totalpages;
 	for (i = 0; i < MAX_NR_ZONES; i++)
 		realtotalpages -=
 			zone_absent_pages_in_node(pgdat->node_id, i,
-								zholes_size);
+						  node_start_pfn, node_end_pfn,
+						  zholes_size);
 	pgdat->node_present_pages = realtotalpages;
 	printk(KERN_DEBUG "On node %d totalpages: %lu\n", pgdat->node_id,
 							realtotalpages);
@@ -4711,6 +4720,7 @@ static unsigned long __paginginit calc_memmap_size(unsigned long spanned_pages,
  * NOTE: pgdat should get zeroed by caller.
  */
 static void __paginginit free_area_init_core(struct pglist_data *pgdat,
+		unsigned long node_start_pfn, unsigned long node_end_pfn,
 		unsigned long *zones_size, unsigned long *zholes_size)
 {
 	enum zone_type j;
@@ -4732,8 +4742,11 @@ static void __paginginit free_area_init_core(struct pglist_data *pgdat,
 		struct zone *zone = pgdat->node_zones + j;
 		unsigned long size, realsize, freesize, memmap_pages;
 
-		size = zone_spanned_pages_in_node(nid, j, zones_size);
+		size = zone_spanned_pages_in_node(nid, j, node_start_pfn,
+						  node_end_pfn, zones_size);
 		realsize = freesize = size - zone_absent_pages_in_node(nid, j,
+								node_start_pfn,
+								node_end_pfn,
 								zholes_size);
 
 		/*
@@ -4847,6 +4860,8 @@ void __paginginit free_area_init_node(int nid, unsigned long *zones_size,
 		unsigned long node_start_pfn, unsigned long *zholes_size)
 {
 	pg_data_t *pgdat = NODE_DATA(nid);
+	unsigned long start_pfn = 0;
+	unsigned long end_pfn = 0;
 
 	/* pg_data_t should be reset to zero when it's allocated */
 	WARN_ON(pgdat->nr_zones || pgdat->classzone_idx);
@@ -4854,7 +4869,11 @@ void __paginginit free_area_init_node(int nid, unsigned long *zones_size,
 	pgdat->node_id = nid;
 	pgdat->node_start_pfn = node_start_pfn;
 	init_zone_allows_reclaim(nid);
-	calculate_node_totalpages(pgdat, zones_size, zholes_size);
+#ifdef CONFIG_HAVE_MEMBLOCK_NODE_MAP
+	get_pfn_range_for_nid(nid, &start_pfn, &end_pfn);
+#endif
+	calculate_node_totalpages(pgdat, start_pfn, end_pfn,
+				  zones_size, zholes_size);
 
 	alloc_node_mem_map(pgdat);
 #ifdef CONFIG_FLAT_NODE_MEM_MAP
@@ -4863,7 +4882,8 @@ void __paginginit free_area_init_node(int nid, unsigned long *zones_size,
 		(unsigned long)pgdat->node_mem_map);
 #endif
 
-	free_area_init_core(pgdat, zones_size, zholes_size);
+	free_area_init_core(pgdat, start_pfn, end_pfn,
+			    zones_size, zholes_size);
 }
 
 #ifdef CONFIG_HAVE_MEMBLOCK_NODE_MAP
@@ -5537,9 +5557,6 @@ void setup_per_zone_wmarks(void)
  */
 static void __meminit calculate_zone_inactive_ratio(struct zone *zone)
 {
-#ifdef CONFIG_FIX_INACTIVE_RATIO
-	zone->inactive_ratio = 1;
-#else
 	unsigned int gb, ratio;
 
 	/* Zone size in gigabytes */
@@ -5550,7 +5567,6 @@ static void __meminit calculate_zone_inactive_ratio(struct zone *zone)
 		ratio = 1;
 
 	zone->inactive_ratio = ratio;
-#endif
 }
 
 static void __meminit setup_per_zone_inactive_ratio(void)

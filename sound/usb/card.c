@@ -244,6 +244,15 @@ static int snd_usb_create_streams(struct snd_usb_audio *chip, int ctrlif)
 		return -EINVAL;
 	}
 
+	rest_bytes = (void *)(host_iface->extra + host_iface->extralen) -
+		control_header;
+
+	/* just to be sure -- this shouldn't hit at all */
+	if (rest_bytes <= 0) {
+		dev_err(&dev->dev, "invalid control header\n");
+		return -EINVAL;
+	}
+
 	switch (protocol) {
 	default:
 		snd_printdd(KERN_WARNING "unknown interface protocol %#02x, assuming v1\n",
@@ -260,6 +269,11 @@ static int snd_usb_create_streams(struct snd_usb_audio *chip, int ctrlif)
 
 		if (!h1->bInCollection) {
 			snd_printk(KERN_INFO "skipping empty audio interface (v1)\n");
+			return -EINVAL;
+		}
+
+		if (rest_bytes < h1->bLength) {
+			dev_err(&dev->dev, "invalid buffer length (v1)\n");
 			return -EINVAL;
 		}
 
@@ -585,9 +599,12 @@ snd_usb_audio_probe(struct usb_device *dev,
 
  __error:
 	if (chip) {
+		/* chip->probing is inside the chip->card object,
+		 * reset before memory is possibly returned.
+		 */
+		chip->probing = 0;
 		if (!chip->num_interfaces)
 			snd_card_free(chip->card);
-		chip->probing = 0;
 	}
 	mutex_unlock(&register_mutex);
  __err_val:

@@ -28,31 +28,23 @@
 
 #define BEQUIET
 
-static int isofs_hashi(const struct dentry *parent, const struct inode *inode,
-		struct qstr *qstr);
-static int isofs_hash(const struct dentry *parent, const struct inode *inode,
-		struct qstr *qstr);
+static int isofs_hashi(const struct dentry *parent, struct qstr *qstr);
+static int isofs_hash(const struct dentry *parent, struct qstr *qstr);
 static int isofs_dentry_cmpi(const struct dentry *parent,
-		const struct inode *pinode,
-		const struct dentry *dentry, const struct inode *inode,
+		const struct dentry *dentry,
 		unsigned int len, const char *str, const struct qstr *name);
 static int isofs_dentry_cmp(const struct dentry *parent,
-		const struct inode *pinode,
-		const struct dentry *dentry, const struct inode *inode,
+		const struct dentry *dentry,
 		unsigned int len, const char *str, const struct qstr *name);
 
 #ifdef CONFIG_JOLIET
-static int isofs_hashi_ms(const struct dentry *parent, const struct inode *inode,
-		struct qstr *qstr);
-static int isofs_hash_ms(const struct dentry *parent, const struct inode *inode,
-		struct qstr *qstr);
+static int isofs_hashi_ms(const struct dentry *parent, struct qstr *qstr);
+static int isofs_hash_ms(const struct dentry *parent, struct qstr *qstr);
 static int isofs_dentry_cmpi_ms(const struct dentry *parent,
-		const struct inode *pinode,
-		const struct dentry *dentry, const struct inode *inode,
+		const struct dentry *dentry,
 		unsigned int len, const char *str, const struct qstr *name);
 static int isofs_dentry_cmp_ms(const struct dentry *parent,
-		const struct inode *pinode,
-		const struct dentry *dentry, const struct inode *inode,
+		const struct dentry *dentry,
 		unsigned int len, const char *str, const struct qstr *name);
 #endif
 
@@ -125,6 +117,7 @@ static void destroy_inodecache(void)
 
 static int isofs_remount(struct super_block *sb, int *flags, char *data)
 {
+	sync_filesystem(sb);
 	if (!(*flags & MS_RDONLY))
 		return -EROFS;
 	return 0;
@@ -265,30 +258,26 @@ static int isofs_dentry_cmp_common(
 }
 
 static int
-isofs_hash(const struct dentry *dentry, const struct inode *inode,
-		struct qstr *qstr)
+isofs_hash(const struct dentry *dentry, struct qstr *qstr)
 {
 	return isofs_hash_common(dentry, qstr, 0);
 }
 
 static int
-isofs_hashi(const struct dentry *dentry, const struct inode *inode,
-		struct qstr *qstr)
+isofs_hashi(const struct dentry *dentry, struct qstr *qstr)
 {
 	return isofs_hashi_common(dentry, qstr, 0);
 }
 
 static int
-isofs_dentry_cmp(const struct dentry *parent, const struct inode *pinode,
-		const struct dentry *dentry, const struct inode *inode,
+isofs_dentry_cmp(const struct dentry *parent, const struct dentry *dentry,
 		unsigned int len, const char *str, const struct qstr *name)
 {
 	return isofs_dentry_cmp_common(len, str, name, 0, 0);
 }
 
 static int
-isofs_dentry_cmpi(const struct dentry *parent, const struct inode *pinode,
-		const struct dentry *dentry, const struct inode *inode,
+isofs_dentry_cmpi(const struct dentry *parent, const struct dentry *dentry,
 		unsigned int len, const char *str, const struct qstr *name)
 {
 	return isofs_dentry_cmp_common(len, str, name, 0, 1);
@@ -296,30 +285,26 @@ isofs_dentry_cmpi(const struct dentry *parent, const struct inode *pinode,
 
 #ifdef CONFIG_JOLIET
 static int
-isofs_hash_ms(const struct dentry *dentry, const struct inode *inode,
-		struct qstr *qstr)
+isofs_hash_ms(const struct dentry *dentry, struct qstr *qstr)
 {
 	return isofs_hash_common(dentry, qstr, 1);
 }
 
 static int
-isofs_hashi_ms(const struct dentry *dentry, const struct inode *inode,
-		struct qstr *qstr)
+isofs_hashi_ms(const struct dentry *dentry, struct qstr *qstr)
 {
 	return isofs_hashi_common(dentry, qstr, 1);
 }
 
 static int
-isofs_dentry_cmp_ms(const struct dentry *parent, const struct inode *pinode,
-		const struct dentry *dentry, const struct inode *inode,
+isofs_dentry_cmp_ms(const struct dentry *parent, const struct dentry *dentry,
 		unsigned int len, const char *str, const struct qstr *name)
 {
 	return isofs_dentry_cmp_common(len, str, name, 1, 0);
 }
 
 static int
-isofs_dentry_cmpi_ms(const struct dentry *parent, const struct inode *pinode,
-		const struct dentry *dentry, const struct inode *inode,
+isofs_dentry_cmpi_ms(const struct dentry *parent, const struct dentry *dentry,
 		unsigned int len, const char *str, const struct qstr *name)
 {
 	return isofs_dentry_cmp_common(len, str, name, 1, 1);
@@ -1303,6 +1288,8 @@ static int isofs_read_inode(struct inode *inode, int relocated)
 
 	de = (struct iso_directory_record *) (bh->b_data + offset);
 	de_len = *(unsigned char *) de;
+	if (de_len < sizeof(struct iso_directory_record))
+		goto fail;
 
 	if (offset + de_len > bufsize) {
 		int frag1 = bufsize - offset;

@@ -182,7 +182,7 @@ static void sdcardfs_evict_inode(struct inode *inode)
 {
 	struct inode *lower_inode;
 
-	truncate_inode_pages_final(&inode->i_data);
+	truncate_inode_pages(&inode->i_data, 0);
 	set_top(SDCARDFS_I(inode), NULL);
 	clear_inode(inode);
 	/*
@@ -313,6 +313,8 @@ static int sdcardfs_show_options(struct vfsmount *mnt, struct seq_file *m,
 		seq_printf(m, ",reserved=%uMB", opts->reserved_mb);
 	if (opts->nocache)
 		seq_printf(m, ",nocache");
+	if (opts->unshared_obb)
+		seq_printf(m, ",unshared_obb");
 
 	return 0;
 };

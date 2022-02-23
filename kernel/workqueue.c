@@ -521,14 +521,21 @@ static inline void debug_work_activate(struct work_struct *work) { }
 static inline void debug_work_deactivate(struct work_struct *work) { }
 #endif
 
-/* allocate ID and assign it to @pool */
+/**
+ * worker_pool_assign_id - allocate ID and assing it to @pool
+ * @pool: the pool pointer of interest
+ *
+ * Returns 0 if ID in [0, WORK_OFFQ_POOL_NONE) is allocated and assigned
+ * successfully, -errno on failure.
+ */
 static int worker_pool_assign_id(struct worker_pool *pool)
 {
 	int ret;
 
 	lockdep_assert_held(&wq_pool_mutex);
 
-	ret = idr_alloc(&worker_pool_idr, pool, 0, 0, GFP_KERNEL);
+	ret = idr_alloc(&worker_pool_idr, pool, 0, WORK_OFFQ_POOL_NONE,
+			GFP_KERNEL);
 	if (ret >= 0) {
 		pool->id = ret;
 		return 0;
@@ -1346,9 +1353,8 @@ static void __queue_work(int cpu, struct workqueue_struct *wq,
 	 */
 	WARN_ON_ONCE(!irqs_disabled());
 
-	debug_work_activate(work);
 
-	/* if dying, only works from the same workqueue are allowed */
+	/* if draining, only works from the same workqueue are allowed */
 	if (unlikely(wq->flags & __WQ_DRAINING) &&
 	    WARN_ON_ONCE(!is_chained_work(wq)))
 		return;
@@ -1425,6 +1431,7 @@ retry:
 		worklist = &pwq->delayed_works;
 	}
 
+	debug_work_activate(work);
 	insert_work(pwq, work, worklist, work_flags);
 
 	spin_unlock(&pwq->pool->lock);
@@ -1764,15 +1771,16 @@ static struct worker *create_worker(struct worker_pool *pool)
 	if (IS_ERR(worker->task))
 		goto fail;
 
+	set_user_nice(worker->task, pool->attrs->nice);
+
+	/* prevent userland from meddling with cpumask of workqueue workers */
+	worker->task->flags |= PF_NO_SETAFFINITY;
+
 	/*
 	 * set_cpus_allowed_ptr() will fail if the cpumask doesn't have any
 	 * online CPUs.  It'll be re-applied when any of the CPUs come up.
 	 */
-	set_user_nice(worker->task, pool->attrs->nice);
 	set_cpus_allowed_ptr(worker->task, pool->attrs->cpumask);
-
-	/* prevent userland from meddling with cpumask of workqueue workers */
-	worker->task->flags |= PF_NO_SETAFFINITY;
 
 	/*
 	 * The caller is responsible for ensuring %POOL_DISASSOCIATED
@@ -3744,20 +3752,21 @@ static void pwq_unbound_release_workfn(struct work_struct *work)
 						  unbound_release_work);
 	struct workqueue_struct *wq = pwq->wq;
 	struct worker_pool *pool = pwq->pool;
-	bool is_last;
-
-	if (WARN_ON_ONCE(!(wq->flags & WQ_UNBOUND)))
-		return;
+	bool is_last = false;
 
 	/*
-	 * Unlink @pwq.  Synchronization against wq->mutex isn't strictly
-	 * necessary on release but do it anyway.  It's easier to verify
-	 * and consistent with the linking path.
+	 * when @pwq is not linked, it doesn't hold any reference to the
+	 * @wq, and @wq is invalid to access.
 	 */
-	mutex_lock(&wq->mutex);
-	list_del_rcu(&pwq->pwqs_node);
-	is_last = list_empty(&wq->pwqs);
-	mutex_unlock(&wq->mutex);
+	if (!list_empty(&pwq->pwqs_node)) {
+		if (WARN_ON_ONCE(!(wq->flags & WQ_UNBOUND)))
+			return;
+
+		mutex_lock(&wq->mutex);
+		list_del_rcu(&pwq->pwqs_node);
+		is_last = list_empty(&wq->pwqs);
+		mutex_unlock(&wq->mutex);
+	}
 
 	mutex_lock(&wq_pool_mutex);
 	put_unbound_pool(pool);
@@ -3845,10 +3854,7 @@ static void link_pwq(struct pool_workqueue *pwq)
 	if (!list_empty(&pwq->pwqs_node))
 		return;
 
-	/*
-	 * Set the matching work_color.  This is synchronized with
-	 * wq->mutex to avoid confusing flush_workqueue().
-	 */
+	/* set the matching work_color */
 	pwq->work_color = wq->work_color;
 
 	/* sync max_active to the current setting */
@@ -5088,10 +5094,6 @@ static int __init init_workqueues(void)
 {
 	int std_nice[NR_STD_WORKER_POOLS] = { 0, HIGHPRI_NICE_LEVEL };
 	int i, cpu;
-
-	/* make sure we have enough bits for OFFQ pool ID */
-	BUILD_BUG_ON((1LU << (BITS_PER_LONG - WORK_OFFQ_POOL_SHIFT)) <
-		     WORK_CPU_END * NR_STD_WORKER_POOLS);
 
 	WARN_ON(__alignof__(struct pool_workqueue) < __alignof__(long long));
 

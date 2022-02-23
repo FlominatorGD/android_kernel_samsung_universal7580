@@ -491,10 +491,11 @@ static int ocfs2_truncate_file(struct inode *inode,
 	 * greater than page size, so we have to truncate them
 	 * anyway.
 	 */
-	unmap_mapping_range(inode->i_mapping, new_i_size + PAGE_SIZE - 1, 0, 1);
-	truncate_inode_pages(inode->i_mapping, new_i_size);
 
 	if (OCFS2_I(inode)->ip_dyn_features & OCFS2_INLINE_DATA_FL) {
+		unmap_mapping_range(inode->i_mapping,
+				    new_i_size + PAGE_SIZE - 1, 0, 1);
+		truncate_inode_pages(inode->i_mapping, new_i_size);
 		status = ocfs2_truncate_inline(inode, di_bh, new_i_size,
 					       i_size_read(inode), 1);
 		if (status)
@@ -512,6 +513,9 @@ static int ocfs2_truncate_file(struct inode *inode,
 		mlog_errno(status);
 		goto bail_unlock_sem;
 	}
+
+	unmap_mapping_range(inode->i_mapping, new_i_size + PAGE_SIZE - 1, 0, 1);
+	truncate_inode_pages(inode->i_mapping, new_i_size);
 
 	status = ocfs2_commit_truncate(osb, inode, di_bh);
 	if (status < 0) {
@@ -2675,17 +2679,7 @@ static loff_t ocfs2_file_llseek(struct file *file, loff_t offset, int whence)
 		goto out;
 	}
 
-	if (offset < 0 && !(file->f_mode & FMODE_UNSIGNED_OFFSET))
-		ret = -EINVAL;
-	if (!ret && offset > inode->i_sb->s_maxbytes)
-		ret = -EINVAL;
-	if (ret)
-		goto out;
-
-	if (offset != file->f_pos) {
-		file->f_pos = offset;
-		file->f_version = 0;
-	}
+	offset = vfs_setpos(file, offset, inode->i_sb->s_maxbytes);
 
 out:
 	mutex_unlock(&inode->i_mutex);

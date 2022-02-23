@@ -939,6 +939,7 @@ ieee80211_rx_h_check(struct ieee80211_rx_data *rx)
 	 */
 	if (rx->skb->len >= 24 && rx->sta &&
 	    !ieee80211_is_ctl(hdr->frame_control) &&
+	    !ieee80211_is_nullfunc(hdr->frame_control) &&
 	    !ieee80211_is_qos_nullfunc(hdr->frame_control) &&
 	    !is_multicast_ether_addr(hdr->addr1)) {
 		if (unlikely(ieee80211_has_retry(hdr->frame_control) &&
@@ -1585,13 +1586,11 @@ ieee80211_rx_h_defragment(struct ieee80211_rx_data *rx)
 	sc = le16_to_cpu(hdr->seq_ctrl);
 	frag = sc & IEEE80211_SCTL_FRAG;
 
-	if (is_multicast_ether_addr(hdr->addr1)) {
-		rx->local->dot11MulticastReceivedFrameCount++;
-		goto out_no_led;
-	}
-
 	if (likely(!ieee80211_has_morefrags(fc) && frag == 0))
 		goto out;
+
+	if (is_multicast_ether_addr(hdr->addr1))
+		return RX_DROP_MONITOR;
 
 	I802_DEBUG_INC(rx->local->rx_handlers_fragments);
 
@@ -1684,7 +1683,6 @@ ieee80211_rx_h_defragment(struct ieee80211_rx_data *rx)
 
  out:
 	ieee80211_led_rx(rx->local);
- out_no_led:
 	if (rx->sta)
 		rx->sta->rx_packets++;
 	return RX_CONTINUE;
@@ -3002,6 +3000,8 @@ static int prepare_for_handlers(struct ieee80211_rx_data *rx,
 	case NL80211_IFTYPE_STATION:
 		if (!bssid && !sdata->u.mgd.use_4addr)
 			return 0;
+		if (ieee80211_is_robust_mgmt_frame(skb) && !rx->sta)
+			return false;
 		if (!multicast &&
 		    !ether_addr_equal(sdata->vif.addr, hdr->addr1)) {
 			if (!(sdata->dev->flags & IFF_PROMISC) ||

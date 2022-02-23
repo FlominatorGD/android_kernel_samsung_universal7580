@@ -921,7 +921,7 @@ static netdev_tx_t ipip6_tunnel_xmit(struct sk_buff *skb,
 		iph->ttl	=	iph6->hop_limit;
 
 	skb->ip_summed = CHECKSUM_NONE;
-	ip_select_ident(skb, NULL);
+	ip_select_ident(dev_net(rt->dst.dev), skb, NULL);
 	iptunnel_xmit(skb, dev);
 	return NETDEV_TX_OK;
 
@@ -1400,8 +1400,11 @@ static int ipip6_newlink(struct net *src_net, struct net_device *dev,
 		return err;
 
 #ifdef CONFIG_IPV6_SIT_6RD
-	if (ipip6_netlink_6rd_parms(data, &ip6rd))
+	if (ipip6_netlink_6rd_parms(data, &ip6rd)) {
 		err = ipip6_tunnel_update_6rd(nt, &ip6rd);
+		if (err < 0)
+			unregister_netdevice_queue(dev, NULL);
+	}
 #endif
 
 	return err;

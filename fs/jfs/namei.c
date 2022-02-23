@@ -176,8 +176,7 @@ static int jfs_create(struct inode *dip, struct dentry *dentry, umode_t mode,
 		unlock_new_inode(ip);
 		iput(ip);
 	} else {
-		unlock_new_inode(ip);
-		d_instantiate(dentry, ip);
+		d_instantiate_new(dentry, ip);
 	}
 
       out2:
@@ -309,8 +308,7 @@ static int jfs_mkdir(struct inode *dip, struct dentry *dentry, umode_t mode)
 		unlock_new_inode(ip);
 		iput(ip);
 	} else {
-		unlock_new_inode(ip);
-		d_instantiate(dentry, ip);
+		d_instantiate_new(dentry, ip);
 	}
 
       out2:
@@ -1043,8 +1041,7 @@ static int jfs_symlink(struct inode *dip, struct dentry *dentry,
 		unlock_new_inode(ip);
 		iput(ip);
 	} else {
-		unlock_new_inode(ip);
-		d_instantiate(dentry, ip);
+		d_instantiate_new(dentry, ip);
 	}
 
       out2:
@@ -1424,8 +1421,7 @@ static int jfs_mknod(struct inode *dir, struct dentry *dentry,
 		unlock_new_inode(ip);
 		iput(ip);
 	} else {
-		unlock_new_inode(ip);
-		d_instantiate(dentry, ip);
+		d_instantiate_new(dentry, ip);
 	}
 
       out1:
@@ -1538,8 +1534,7 @@ const struct file_operations jfs_dir_operations = {
 	.llseek		= generic_file_llseek,
 };
 
-static int jfs_ci_hash(const struct dentry *dir, const struct inode *inode,
-		struct qstr *this)
+static int jfs_ci_hash(const struct dentry *dir, struct qstr *this)
 {
 	unsigned long hash;
 	int i;
@@ -1552,9 +1547,7 @@ static int jfs_ci_hash(const struct dentry *dir, const struct inode *inode,
 	return 0;
 }
 
-static int jfs_ci_compare(const struct dentry *parent,
-		const struct inode *pinode,
-		const struct dentry *dentry, const struct inode *inode,
+static int jfs_ci_compare(const struct dentry *parent, const struct dentry *dentry,
 		unsigned int len, const char *str, const struct qstr *name)
 {
 	int i, result = 1;

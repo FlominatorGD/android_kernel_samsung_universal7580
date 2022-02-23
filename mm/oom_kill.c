@@ -258,8 +258,6 @@ enum oom_scan_t oom_scan_process_thread(struct task_struct *task,
 		unsigned long totalpages, const nodemask_t *nodemask,
 		bool force_kill)
 {
-	if (task->exit_state)
-		return OOM_SCAN_CONTINUE;
 	if (oom_unkillable_task(task, NULL, nodemask))
 		return OOM_SCAN_CONTINUE;
 
@@ -705,6 +703,9 @@ void pagefault_out_of_memory(void)
 	struct zonelist *zonelist;
 
 	if (mem_cgroup_oom_synchronize(true))
+		return;
+
+	if (fatal_signal_pending(current))
 		return;
 
 	zonelist = node_zonelist(first_online_node, GFP_KERNEL);

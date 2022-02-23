@@ -88,7 +88,6 @@ int config_ep_by_speed(struct usb_gadget *g,
 			struct usb_function *f,
 			struct usb_ep *_ep)
 {
-	struct usb_composite_dev	*cdev = get_gadget_data(g);
 	struct usb_endpoint_descriptor *chosen_desc = NULL;
 	struct usb_descriptor_header **speed_desc = NULL;
 
@@ -160,8 +159,12 @@ ep_found:
 			_ep->maxburst = comp_desc->bMaxBurst + 1;
 			break;
 		default:
-			if (comp_desc->bMaxBurst != 0)
+			if (comp_desc->bMaxBurst != 0) {
+				struct usb_composite_dev *cdev;
+
+				cdev = get_gadget_data(g);
 				ERROR(cdev, "ep0 bMaxBurst must be 0\n");
+			}
 			_ep->maxburst = 1;
 			break;
 		}
@@ -189,7 +192,7 @@ int usb_add_function(struct usb_configuration *config,
 {
 	int	value = -EINVAL;
 
-	DBG(config->cdev, "adding '%s'/%p to config '%s'/%p\n",
+	DBG(config->cdev, "adding '%s'/%pK to config '%s'/%pK\n",
 			function->name, function,
 			config->label, config);
 
@@ -223,7 +226,7 @@ int usb_add_function(struct usb_configuration *config,
 
 done:
 	if (value)
-		DBG(config->cdev, "adding '%s'/%p --> %d\n",
+		DBG(config->cdev, "adding '%s'/%pK --> %d\n",
 				function->name, function, value);
 	return value;
 }
@@ -268,8 +271,11 @@ int usb_function_deactivate(struct usb_function *function)
 
 	spin_lock_irqsave(&cdev->lock, flags);
 
-	if (cdev->deactivations == 0)
+	if (cdev->deactivations == 0) {
+		spin_unlock_irqrestore(&cdev->lock, flags);
 		status = usb_gadget_disconnect(cdev->gadget);
+		spin_lock_irqsave(&cdev->lock, flags);
+	}
 	if (status == 0)
 		cdev->deactivations++;
 
@@ -300,8 +306,11 @@ int usb_function_activate(struct usb_function *function)
 		status = -EINVAL;
 	else {
 		cdev->deactivations--;
-		if (cdev->deactivations == 0)
+		if (cdev->deactivations == 0) {
+			spin_unlock_irqrestore(&cdev->lock, flags);
 			status = usb_gadget_connect(cdev->gadget);
+			spin_lock_irqsave(&cdev->lock, flags);
+		}
 	}
 
 	spin_unlock_irqrestore(&cdev->lock, flags);
@@ -721,7 +730,7 @@ static int set_config(struct usb_composite_dev *cdev,
 
 		result = f->set_alt(f, tmp, 0);
 		if (result < 0) {
-			DBG(cdev, "interface %d (%s/%p) alt 0 --> %d\n",
+			DBG(cdev, "interface %d (%s/%pK) alt 0 --> %d\n",
 					tmp, f->name, f, result);
 
 			reset_config(cdev);
@@ -796,7 +805,7 @@ int usb_add_config(struct usb_composite_dev *cdev,
 	if (!bind)
 		goto done;
 
-	DBG(cdev, "adding config #%u '%s'/%p\n",
+	DBG(cdev, "adding config #%u '%s'/%pK\n",
 			config->bConfigurationValue,
 			config->label, config);
 
@@ -813,7 +822,7 @@ int usb_add_config(struct usb_composite_dev *cdev,
 					struct usb_function, list);
 			list_del(&f->list);
 			if (f->unbind) {
-				DBG(cdev, "unbind function '%s'/%p\n",
+				DBG(cdev, "unbind function '%s'/%pK\n",
 					f->name, f);
 				f->unbind(config, f);
 				/* may free memory for "f" */
@@ -824,7 +833,7 @@ int usb_add_config(struct usb_composite_dev *cdev,
 	} else {
 		unsigned	i;
 
-		DBG(cdev, "cfg %d/%p speeds:%s%s%s\n",
+		DBG(cdev, "cfg %d/%pK speeds:%s%s%s\n",
 			config->bConfigurationValue, config,
 			config->superspeed ? " super" : "",
 			config->highspeed ? " high" : "",
@@ -839,7 +848,7 @@ int usb_add_config(struct usb_composite_dev *cdev,
 
 			if (!f)
 				continue;
-			DBG(cdev, "  interface %d = %s/%p\n",
+			DBG(cdev, "  interface %d = %s/%pK\n",
 				i, f->name, f);
 		}
 	}
@@ -868,13 +877,13 @@ static void unbind_config(struct usb_composite_dev *cdev,
 				struct usb_function, list);
 		list_del(&f->list);
 		if (f->unbind) {
-			DBG(cdev, "unbind function '%s'/%p\n", f->name, f);
+			DBG(cdev, "unbind function '%s'/%pK\n", f->name, f);
 			f->unbind(config, f);
 			/* may free memory for "f" */
 		}
 	}
 	if (config->unbind) {
-		DBG(cdev, "unbind config '%s'/%p\n", config->label, config);
+		DBG(cdev, "unbind config '%s'/%pK\n", config->label, config);
 		config->unbind(config);
 			/* may free memory for "c" */
 	}
@@ -894,7 +903,7 @@ void usb_remove_config(struct usb_composite_dev *cdev,
 {
 	unsigned long flags;
 
-	printk(KERN_DEBUG "usb: %s cdev->config=%p, config=%p\n",
+	printk(KERN_DEBUG "usb: %s cdev->config=%pK, config=%pK\n",
 			__func__, cdev->config, config);
 	spin_lock_irqsave(&cdev->lock, flags);
 
@@ -931,7 +940,7 @@ static void collect_langs(struct usb_gadget_strings **sp, __le16 *buf)
 	while (*sp) {
 		s = *sp;
 		language = cpu_to_le16(s->language);
-		for (tmp = buf; *tmp && tmp < &buf[126]; tmp++) {
+		for (tmp = buf; *tmp && tmp < &buf[USB_MAX_STRING_LEN]; tmp++) {
 			if (*tmp == language)
 				goto repeat;
 		}
@@ -1014,7 +1023,7 @@ static int get_string(struct usb_composite_dev *cdev,
 			collect_langs(sp, s->wData);
 		}
 
-		for (len = 0; len <= 126 && s->wData[len]; len++)
+		for (len = 0; len <= USB_MAX_STRING_LEN && s->wData[len]; len++)
 			continue;
 		if (!len)
 			return -EINVAL;
@@ -1079,11 +1088,11 @@ int usb_string_id(struct usb_composite_dev *cdev)
 		 * supported languages */
 		/* 255 reserved as well? -- mina86 */
 		cdev->next_string_id++;
-		printk(KERN_DEBUG "usb: %s cdev(0x%p)->next_string_id=%d\n",
+		printk(KERN_DEBUG "usb: %s cdev(0x%pK)->next_string_id=%d\n",
 			__func__, cdev, cdev->next_string_id);
 		return cdev->next_string_id;
 	}
-	printk(KERN_DEBUG "usb: %s error cdev(0x%p)->next_string_id=%d\n",
+	printk(KERN_DEBUG "usb: %s error cdev(0x%pK)->next_string_id=%d\n",
 		__func__, cdev, cdev->next_string_id);
 	return -ENODEV;
 }
@@ -1109,7 +1118,7 @@ int usb_string_ids_tab(struct usb_composite_dev *cdev, struct usb_string *str)
 {
 	int next = cdev->next_string_id;
 
-	printk(KERN_DEBUG "usb: %s --cdev(0x%p)->next_string_id=%d\n",
+	printk(KERN_DEBUG "usb: %s --cdev(0x%pK)->next_string_id=%d\n",
 		__func__, cdev, cdev->next_string_id);
 	for (; str->s; ++str) {
 		if (unlikely(next >= 254))
@@ -1258,7 +1267,7 @@ EXPORT_SYMBOL_GPL(usb_gstrings_attach);
 int usb_string_ids_n(struct usb_composite_dev *c, unsigned n)
 {
 	unsigned next = c->next_string_id;
-	printk(KERN_DEBUG "usb: %s --cdev(0x%p)->next_string_id=%d\n",
+	printk(KERN_DEBUG "usb: %s --cdev(0x%pK)->next_string_id=%d\n",
 		__func__, c, c->next_string_id);
 	if (unlikely(n > 254 || (unsigned)next + n > 254))
 		return -ENODEV;
@@ -1540,6 +1549,8 @@ unknown:
 			break;
 
 		case USB_RECIP_ENDPOINT:
+			if (!cdev->config)
+				break;
 			endp = ((w_index & 0x80) >> 3) | (w_index & 0x0f);
 			list_for_each_entry(f, &cdev->config->functions, list) {
 				if (test_bit(endp, f->endpoints))

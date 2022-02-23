@@ -522,6 +522,20 @@ static struct xfrm_state *xfrm_state_construct(struct net *net,
 
 	copy_from_user_state(x, p);
 
+	if (attrs[XFRMA_ENCAP]) {
+		x->encap = kmemdup(nla_data(attrs[XFRMA_ENCAP]),
+				   sizeof(*x->encap), GFP_KERNEL);
+		if (x->encap == NULL)
+			goto error;
+	}
+
+	if (attrs[XFRMA_COADDR]) {
+		x->coaddr = kmemdup(nla_data(attrs[XFRMA_COADDR]),
+				    sizeof(*x->coaddr), GFP_KERNEL);
+		if (x->coaddr == NULL)
+			goto error;
+	}
+
 	if (attrs[XFRMA_SA_EXTRA_FLAGS])
 		x->props.extra_flags = nla_get_u32(attrs[XFRMA_SA_EXTRA_FLAGS]);
 
@@ -545,22 +559,8 @@ static struct xfrm_state *xfrm_state_construct(struct net *net,
 				   attrs[XFRMA_ALG_COMP])))
 		goto error;
 
-	if (attrs[XFRMA_ENCAP]) {
-		x->encap = kmemdup(nla_data(attrs[XFRMA_ENCAP]),
-				   sizeof(*x->encap), GFP_KERNEL);
-		if (x->encap == NULL)
-			goto error;
-	}
-
 	if (attrs[XFRMA_TFCPAD])
 		x->tfcpad = nla_get_u32(attrs[XFRMA_TFCPAD]);
-
-	if (attrs[XFRMA_COADDR]) {
-		x->coaddr = kmemdup(nla_data(attrs[XFRMA_COADDR]),
-				    sizeof(*x->coaddr), GFP_KERNEL);
-		if (x->coaddr == NULL)
-			goto error;
-	}
 
 	xfrm_mark_get(attrs, &x->mark);
 
@@ -1272,10 +1272,13 @@ static void copy_templates(struct xfrm_policy *xp, struct xfrm_user_tmpl *ut,
 
 static int validate_tmpl(int nr, struct xfrm_user_tmpl *ut, u16 family)
 {
+	u16 prev_family;
 	int i;
 
 	if (nr > XFRM_MAX_DEPTH)
 		return -EINVAL;
+
+	prev_family = family;
 
 	for (i = 0; i < nr; i++) {
 		/* We never validated the ut->family value, so many
@@ -1287,6 +1290,20 @@ static int validate_tmpl(int nr, struct xfrm_user_tmpl *ut, u16 family)
 		 */
 		if (!ut[i].family)
 			ut[i].family = family;
+
+		switch (ut[i].mode) {
+		case XFRM_MODE_TUNNEL:
+		case XFRM_MODE_BEET:
+			break;
+		default:
+			if (ut[i].family != prev_family)
+				return -EINVAL;
+			break;
+		}
+		if (ut[i].mode >= XFRM_MODE_MAX)
+			return -EINVAL;
+
+		prev_family = ut[i].family;
 
 		switch (ut[i].family) {
 		case AF_INET:
@@ -1589,6 +1606,10 @@ static struct sk_buff *xfrm_policy_netlink(struct sk_buff *in_skb,
 	struct xfrm_dump_info info;
 	struct sk_buff *skb;
 	int err;
+
+	err = verify_policy_dir(dir);
+	if (err)
+		return ERR_PTR(err);
 
 	skb = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
 	if (!skb)
@@ -2136,6 +2157,10 @@ static int xfrm_do_migrate(struct sk_buff *skb, struct nlmsghdr *nlh,
 	int err;
 	int n = 0;
 
+	err = verify_policy_dir(pi->dir);
+	if (err)
+		return err;
+
 	if (attrs[XFRMA_MIGRATE] == NULL)
 		return -EINVAL;
 
@@ -2250,6 +2275,11 @@ static int xfrm_send_migrate(const struct xfrm_selector *sel, u8 dir, u8 type,
 {
 	struct net *net = &init_net;
 	struct sk_buff *skb;
+	int err;
+
+	err = verify_policy_dir(dir);
+	if (err)
+		return err;
 
 	skb = nlmsg_new(xfrm_migrate_msgsize(num_migrate, !!k), GFP_ATOMIC);
 	if (skb == NULL)
@@ -2878,6 +2908,11 @@ out_free_skb:
 
 static int xfrm_send_policy_notify(struct xfrm_policy *xp, int dir, const struct km_event *c)
 {
+	int err;
+
+	err = verify_policy_dir(dir);
+	if (err)
+		return err;
 
 	switch (c->event) {
 	case XFRM_MSG_NEWPOLICY:

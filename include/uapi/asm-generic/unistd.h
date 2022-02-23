@@ -191,6 +191,7 @@ __SYSCALL(__NR_quotactl, sys_quotactl)
 
 /* fs/readdir.c */
 #define __NR_getdents64 61
+#define __ARCH_WANT_COMPAT_SYS_GETDENTS64
 __SC_COMP(__NR_getdents64, sys_getdents64, compat_sys_getdents64)
 
 /* fs/read_write.c */
@@ -361,7 +362,7 @@ __SYSCALL(__NR_syslog, sys_syslog)
 #define __NR_ptrace 117
 __SYSCALL(__NR_ptrace, sys_ptrace)
 
-/* kernel/sched.c */
+/* kernel/sched/core.c */
 #define __NR_sched_setparam 118
 __SYSCALL(__NR_sched_setparam, sys_sched_setparam)
 #define __NR_sched_setscheduler 119

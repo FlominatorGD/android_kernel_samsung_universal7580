@@ -221,12 +221,10 @@ int btrfs_truncate_free_space_cache(struct btrfs_root *root,
 				    struct btrfs_path *path,
 				    struct inode *inode)
 {
-	loff_t oldsize;
 	int ret = 0;
 
-	oldsize = i_size_read(inode);
 	btrfs_i_size_write(inode, 0);
-	truncate_pagecache(inode, oldsize, 0);
+	truncate_pagecache(inode, 0);
 
 	/*
 	 * We don't need an orphan item because truncating the free space cache
@@ -704,8 +702,10 @@ static int __load_free_space_cache(struct btrfs_root *root, struct inode *inode,
 	while (num_entries) {
 		e = kmem_cache_zalloc(btrfs_free_space_cachep,
 				      GFP_NOFS);
-		if (!e)
+		if (!e) {
+			ret = -ENOMEM;
 			goto free_cache;
+		}
 
 		ret = io_ctl_read_entry(&io_ctl, e, &type);
 		if (ret) {
@@ -714,6 +714,7 @@ static int __load_free_space_cache(struct btrfs_root *root, struct inode *inode,
 		}
 
 		if (!e->bytes) {
+			ret = -1;
 			kmem_cache_free(btrfs_free_space_cachep, e);
 			goto free_cache;
 		}
@@ -733,6 +734,7 @@ static int __load_free_space_cache(struct btrfs_root *root, struct inode *inode,
 			num_bitmaps--;
 			e->bitmap = kzalloc(PAGE_CACHE_SIZE, GFP_NOFS);
 			if (!e->bitmap) {
+				ret = -ENOMEM;
 				kmem_cache_free(
 					btrfs_free_space_cachep, e);
 				goto free_cache;
@@ -1800,7 +1802,7 @@ out:
 static bool try_merge_free_space(struct btrfs_free_space_ctl *ctl,
 			  struct btrfs_free_space *info, bool update_stat)
 {
-	struct btrfs_free_space *left_info;
+	struct btrfs_free_space *left_info = NULL;
 	struct btrfs_free_space *right_info;
 	bool merged = false;
 	u64 offset = info->offset;
@@ -1815,7 +1817,7 @@ static bool try_merge_free_space(struct btrfs_free_space_ctl *ctl,
 	if (right_info && rb_prev(&right_info->offset_index))
 		left_info = rb_entry(rb_prev(&right_info->offset_index),
 				     struct btrfs_free_space, offset_index);
-	else
+	else if (!right_info)
 		left_info = tree_search_offset(ctl, offset - 1, 0, 0);
 
 	if (right_info && !right_info->bitmap) {

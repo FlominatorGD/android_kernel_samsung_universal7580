@@ -88,7 +88,7 @@
 #include <linux/virtio_net.h>
 #include <linux/errqueue.h>
 #include <linux/net_tstamp.h>
-
+#include <linux/reciprocal_div.h>
 #ifdef CONFIG_INET
 #include <net/inet_common.h>
 #endif
@@ -517,7 +517,8 @@ static int prb_calc_retire_blk_tmo(struct packet_sock *po,
 			msec = 1;
 			div = speed / 1000;
 		}
-	}
+	} else
+		return DEFAULT_PRB_RETIRE_TOV;
 
 	mbits = (blk_size_in_bytes * 8) / (1024 * 1024);
 
@@ -1154,7 +1155,7 @@ static unsigned int fanout_demux_hash(struct packet_fanout *f,
 				      struct sk_buff *skb,
 				      unsigned int num)
 {
-	return (((u64)skb->rxhash) * num) >> 32;
+	return reciprocal_divide(skb->rxhash, num);
 }
 
 static unsigned int fanout_demux_lb(struct packet_fanout *f,
@@ -1171,6 +1172,13 @@ static unsigned int fanout_demux_cpu(struct packet_fanout *f,
 				     unsigned int num)
 {
 	return smp_processor_id() % num;
+}
+
+static unsigned int fanout_demux_rnd(struct packet_fanout *f,
+				     struct sk_buff *skb,
+				     unsigned int num)
+{
+	return prandom_u32_max(num);
 }
 
 static unsigned int fanout_demux_rollover(struct packet_fanout *f,
@@ -1229,6 +1237,9 @@ static int packet_rcv_fanout(struct sk_buff *skb, struct net_device *dev,
 		break;
 	case PACKET_FANOUT_CPU:
 		idx = fanout_demux_cpu(f, skb, num);
+		break;
+	case PACKET_FANOUT_RND:
+		idx = fanout_demux_rnd(f, skb, num);
 		break;
 	case PACKET_FANOUT_ROLLOVER:
 		idx = fanout_demux_rollover(f, skb, 0, (unsigned int) -1, num);
@@ -1303,6 +1314,7 @@ static int fanout_add(struct sock *sk, u16 id, u16 type_flags)
 	case PACKET_FANOUT_HASH:
 	case PACKET_FANOUT_LB:
 	case PACKET_FANOUT_CPU:
+	case PACKET_FANOUT_RND:
 		break;
 	default:
 		return -EINVAL;
@@ -1750,7 +1762,8 @@ static int tpacket_rcv(struct sk_buff *skb, struct net_device *dev,
 	int skb_len = skb->len;
 	unsigned int snaplen, res;
 	unsigned long status = TP_STATUS_USER;
-	unsigned short macoff, netoff, hdrlen;
+	unsigned short macoff, hdrlen;
+	unsigned int netoff;
 	struct sk_buff *copy_skb = NULL;
 	struct timespec ts;
 	__u32 ts_status;
@@ -1793,6 +1806,12 @@ static int tpacket_rcv(struct sk_buff *skb, struct net_device *dev,
 				       (maclen < 16 ? 16 : maclen)) +
 			po->tp_reserve;
 		macoff = netoff - maclen;
+	}
+	if (netoff > USHRT_MAX) {
+		spin_lock(&sk->sk_receive_queue.lock);
+		po->stats.stats1.tp_drops++;
+		spin_unlock(&sk->sk_receive_queue.lock);
+		goto drop_n_restore;
 	}
 	if (po->tp_version <= TPACKET_V2) {
 		if (macoff + snaplen > po->rx_ring.frame_size) {
@@ -2097,6 +2116,7 @@ static int tpacket_snd(struct packet_sock *po, struct msghdr *msg)
 	int err, reserve = 0;
 	void *ph;
 	struct sockaddr_ll *saddr = (struct sockaddr_ll *)msg->msg_name;
+	bool need_wait = !(msg->msg_flags & MSG_DONTWAIT);
 	int tp_len, size_max;
 	unsigned char *addr;
 	int len_sum = 0;
@@ -2139,10 +2159,10 @@ static int tpacket_snd(struct packet_sock *po, struct msghdr *msg)
 
 	do {
 		ph = packet_current_frame(po, &po->tx_ring,
-				TP_STATUS_SEND_REQUEST);
-
+					  TP_STATUS_SEND_REQUEST);
 		if (unlikely(ph == NULL)) {
-			schedule();
+			if (need_wait && need_resched())
+				schedule();
 			continue;
 		}
 
@@ -2195,10 +2215,8 @@ static int tpacket_snd(struct packet_sock *po, struct msghdr *msg)
 		}
 		packet_increment_head(&po->tx_ring);
 		len_sum += tp_len;
-	} while (likely((ph != NULL) ||
-			((!(msg->msg_flags & MSG_DONTWAIT)) &&
-			 (atomic_read(&po->tx_ring.pending))))
-		);
+	} while (likely((ph != NULL) || (need_wait &&
+					 atomic_read(&po->tx_ring.pending))));
 
 	err = len_sum;
 	goto out_put;
@@ -2353,12 +2371,17 @@ static int packet_snd(struct socket *sock,
 	if (skb == NULL)
 		goto out_unlock;
 
-	skb_set_network_header(skb, reserve);
+	skb_reset_network_header(skb);
 
 	err = -EINVAL;
 	if (sock->type == SOCK_DGRAM &&
 	    (offset = dev_hard_header(skb, dev, ntohs(proto), addr, NULL, len)) < 0)
 		goto out_free;
+	else if (reserve) {
+		skb_reserve(skb, -reserve);
+		if (len < reserve)
+			skb_reset_network_header(skb);
+	}
 
 	/* Returns -EFAULT on error */
 	err = skb_copy_datagram_from_iovec(skb, offset, msg->msg_iov, 0, len);
@@ -2854,18 +2877,27 @@ static int packet_recvmsg(struct kiocb *iocb, struct socket *sock,
 	sock_recv_ts_and_drops(msg, sk, skb);
 
 	if (msg->msg_name) {
+		int copy_len;
+
 		/* If the address length field is there to be filled
 		 * in, we fill it in now.
 		 */
 		if (sock->type == SOCK_PACKET) {
 			msg->msg_namelen = sizeof(struct sockaddr_pkt);
+			copy_len = msg->msg_namelen;
 		} else {
 			struct sockaddr_ll *sll = &PACKET_SKB_CB(skb)->sa.ll;
 			msg->msg_namelen = sll->sll_halen +
 				offsetof(struct sockaddr_ll, sll_addr);
+			copy_len = msg->msg_namelen;
+			if (msg->msg_namelen < sizeof(struct sockaddr_ll)) {
+				memset(msg->msg_name +
+				       offsetof(struct sockaddr_ll, sll_addr),
+				       0, sizeof(sll->sll_addr));
+				msg->msg_namelen = sizeof(struct sockaddr_ll);
+			}
 		}
-		memcpy(msg->msg_name, &PACKET_SKB_CB(skb)->sa,
-		       msg->msg_namelen);
+		memcpy(msg->msg_name, &PACKET_SKB_CB(skb)->sa, copy_len);
 	}
 
 	if (pkt_sk(sk)->auxdata) {
@@ -3779,7 +3811,7 @@ static int packet_set_ring(struct sock *sk, union tpacket_req_u *req_u,
 		register_prot_hook(sk);
 	}
 	spin_unlock(&po->bind_lock);
-	if (closing && (po->tp_version > TPACKET_V2)) {
+	if (pg_vec && (po->tp_version > TPACKET_V2)) {
 		/* Because we don't support block-based V3 on tx-ring */
 		if (!tx_ring)
 			prb_shutdown_retire_blk_timer(po, tx_ring, rb_queue);

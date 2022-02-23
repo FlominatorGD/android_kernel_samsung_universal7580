@@ -1405,13 +1405,25 @@ ims_pcu_get_cdc_union_desc(struct usb_interface *intf)
 		return NULL;
 	}
 
-	while (buflen > 0) {
+	while (buflen >= sizeof(*union_desc)) {
 		union_desc = (struct usb_cdc_union_desc *)buf;
+
+		if (union_desc->bLength > buflen) {
+			dev_err(&intf->dev, "Too large descriptor\n");
+			return NULL;
+		}
 
 		if (union_desc->bDescriptorType == USB_DT_CS_INTERFACE &&
 		    union_desc->bDescriptorSubType == USB_CDC_UNION_TYPE) {
 			dev_dbg(&intf->dev, "Found union header\n");
-			return union_desc;
+
+			if (union_desc->bLength >= sizeof(*union_desc))
+				return union_desc;
+
+			dev_err(&intf->dev,
+				"Union descriptor to short (%d vs %zd\n)",
+				union_desc->bLength, sizeof(*union_desc));
+			return NULL;
 		}
 
 		buflen -= union_desc->bLength;
@@ -1629,7 +1641,7 @@ static int ims_pcu_identify_type(struct ims_pcu *pcu, u8 *device_id)
 
 static int ims_pcu_init_application_mode(struct ims_pcu *pcu)
 {
-	static atomic_t device_no = ATOMIC_INIT(0);
+	static atomic_t device_no = ATOMIC_INIT(-1);
 
 	const struct ims_pcu_device_info *info;
 	u8 device_id;
@@ -1661,7 +1673,7 @@ static int ims_pcu_init_application_mode(struct ims_pcu *pcu)
 	}
 
 	/* Device appears to be operable, complete initialization */
-	pcu->device_no = atomic_inc_return(&device_no) - 1;
+	pcu->device_no = atomic_inc_return(&device_no);
 
 	error = ims_pcu_setup_backlight(pcu);
 	if (error)

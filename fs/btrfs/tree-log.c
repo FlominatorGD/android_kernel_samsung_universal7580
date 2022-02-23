@@ -1874,7 +1874,9 @@ again:
 		else {
 			ret = find_dir_range(log, path, dirid, key_type,
 					     &range_start, &range_end);
-			if (ret != 0)
+			if (ret < 0)
+				goto out;
+			else if (ret > 0)
 				break;
 		}
 
@@ -2879,12 +2881,18 @@ static noinline int log_dir_items(struct btrfs_trans_handle *trans,
 	}
 	btrfs_release_path(path);
 
-	/* find the first key from this transaction again */
+	/*
+	 * Find the first key from this transaction again.  See the note for
+	 * log_new_dir_dentries, if we're logging a directory recursively we
+	 * won't be holding its i_mutex, which means we can modify the directory
+	 * while we're logging it.  If we remove an entry between our first
+	 * search and this search we'll not find the key again and can just
+	 * bail.
+	 */
+search:
 	ret = btrfs_search_slot(NULL, root, &min_key, path, 0, 0);
-	if (ret != 0) {
-		WARN_ON(1);
+	if (ret != 0)
 		goto done;
-	}
 
 	/*
 	 * we have a block from this transaction, log every item in it
@@ -2899,6 +2907,13 @@ static noinline int log_dir_items(struct btrfs_trans_handle *trans,
 
 			if (min_key.objectid != ino || min_key.type != key_type)
 				goto done;
+
+			if (need_resched()) {
+				btrfs_release_path(path);
+				cond_resched();
+				goto search;
+			}
+
 			ret = overwrite_item(trans, log, dst_path, src, i,
 					     &min_key);
 			if (ret) {

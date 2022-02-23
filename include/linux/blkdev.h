@@ -99,7 +99,7 @@ struct request {
 
 	struct request_queue *q;
 
-	unsigned int cmd_flags;
+	u64 cmd_flags;
 	enum rq_cmd_type_bits cmd_type;
 	unsigned long atomic_flags;
 
@@ -159,8 +159,6 @@ struct request {
 #endif
 
 	unsigned short ioprio;
-
-	int ref_count;
 
 	void *special;		/* opaque pointer available for LLD use */
 	char *buffer;		/* kaddr of the current segment if available */
@@ -267,6 +265,7 @@ struct queue_limits {
 	unsigned int		max_sectors;
 	unsigned int		max_segment_size;
 	unsigned int		physical_block_size;
+	unsigned int		logical_block_size;
 	unsigned int		alignment_offset;
 	unsigned int		io_min;
 	unsigned int		io_opt;
@@ -275,7 +274,6 @@ struct queue_limits {
 	unsigned int		discard_granularity;
 	unsigned int		discard_alignment;
 
-	unsigned short		logical_block_size;
 	unsigned short		max_segments;
 	unsigned short		max_integrity_segments;
 
@@ -385,8 +383,6 @@ struct request_queue {
 
 	unsigned int		nr_sorted;
 	unsigned int		in_flight[2];
-	unsigned long long	in_flight_time;
-	ktime_t			in_flight_stamp;
 	/*
 	 * Number of active block driver functions for which blk_drain_queue()
 	 * must wait. Must be incremented around functions that unlock the
@@ -428,7 +424,6 @@ struct request_queue {
 	struct list_head	flush_queue[2];
 	struct list_head	flush_data_in_flight;
 	struct request		flush_rq;
-	unsigned long           flush_ios;
 
 	struct mutex		sysfs_lock;
 
@@ -573,7 +568,7 @@ static inline void queue_flag_clear(unsigned int flag, struct request_queue *q)
 
 #define list_entry_rq(ptr)	list_entry((ptr), struct request, queuelist)
 
-#define rq_data_dir(rq)		((rq)->cmd_flags & 1)
+#define rq_data_dir(rq)		((int)((rq)->cmd_flags & 1))
 
 static inline unsigned int blk_queue_cluster(struct request_queue *q)
 {
@@ -805,7 +800,7 @@ extern void blk_execute_rq_nowait(struct request_queue *, struct gendisk *,
 
 static inline struct request_queue *bdev_get_queue(struct block_device *bdev)
 {
-	return bdev->bd_disk->queue;
+	return bdev->bd_disk->queue;	/* this is never NULL */
 }
 
 /*
@@ -922,7 +917,7 @@ extern void blk_queue_max_discard_sectors(struct request_queue *q,
 		unsigned int max_discard_sectors);
 extern void blk_queue_max_write_same_sectors(struct request_queue *q,
 		unsigned int max_write_same_sectors);
-extern void blk_queue_logical_block_size(struct request_queue *, unsigned short);
+extern void blk_queue_logical_block_size(struct request_queue *, unsigned int);
 extern void blk_queue_physical_block_size(struct request_queue *, unsigned int);
 extern void blk_queue_alignment_offset(struct request_queue *q,
 				       unsigned int alignment);
@@ -1134,7 +1129,7 @@ static inline unsigned int queue_max_segment_size(struct request_queue *q)
 	return q->limits.max_segment_size;
 }
 
-static inline unsigned short queue_logical_block_size(struct request_queue *q)
+static inline unsigned queue_logical_block_size(struct request_queue *q)
 {
 	int retval = 512;
 
@@ -1144,7 +1139,7 @@ static inline unsigned short queue_logical_block_size(struct request_queue *q)
 	return retval;
 }
 
-static inline unsigned short bdev_logical_block_size(struct block_device *bdev)
+static inline unsigned int bdev_logical_block_size(struct block_device *bdev)
 {
 	return queue_logical_block_size(bdev_get_queue(bdev));
 }
@@ -1466,7 +1461,7 @@ static inline int blk_rq_map_integrity_sg(struct request_queue *q,
 }
 static inline struct blk_integrity *bdev_get_integrity(struct block_device *b)
 {
-	return 0;
+	return NULL;
 }
 static inline struct blk_integrity *blk_get_integrity(struct gendisk *disk)
 {
@@ -1514,6 +1509,7 @@ static inline bool blk_integrity_is_initialized(struct gendisk *g)
 struct block_device_operations {
 	int (*open) (struct block_device *, fmode_t);
 	void (*release) (struct gendisk *, fmode_t);
+	int (*rw_page)(struct block_device *, sector_t, struct page *, int rw);
 	int (*ioctl) (struct block_device *, fmode_t, unsigned, unsigned long);
 	int (*compat_ioctl) (struct block_device *, fmode_t, unsigned, unsigned long);
 	int (*direct_access) (struct block_device *, sector_t,
@@ -1532,7 +1528,13 @@ struct block_device_operations {
 
 extern int __blkdev_driver_ioctl(struct block_device *, fmode_t, unsigned int,
 				 unsigned long);
+extern int bdev_read_page(struct block_device *, sector_t, struct page *);
+extern int bdev_write_page(struct block_device *, sector_t, struct page *,
+						struct writeback_control *);
 #else /* CONFIG_BLOCK */
+
+struct block_device;
+
 /*
  * stubs for when the block layer is configured out
  */
@@ -1566,6 +1568,12 @@ static inline void blk_schedule_flush_plug(struct task_struct *task)
 static inline bool blk_needs_flush_plug(struct task_struct *tsk)
 {
 	return false;
+}
+
+static inline int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
+				     sector_t *error_sector)
+{
+	return 0;
 }
 
 #endif /* CONFIG_BLOCK */

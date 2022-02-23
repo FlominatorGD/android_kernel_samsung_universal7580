@@ -3,6 +3,7 @@
 
 
 #include <linux/netdevice.h>
+#include <linux/static_key.h>
 #include <uapi/linux/netfilter/x_tables.h>
 
 /**
@@ -220,15 +221,11 @@ struct xt_table_info {
 	 * @stacksize jumps (number of user chains) can possibly be made.
 	 */
 	unsigned int stacksize;
-	unsigned int __percpu *stackptr;
 	void ***jumpstack;
-	/* ipt_entry tables: one per CPU */
-	/* Note : this field MUST be the last one, see XT_TABLE_INFO_SZ */
-	void *entries[1];
+
+	unsigned char entries[0] __aligned(8);
 };
 
-#define XT_TABLE_INFO_SZ (offsetof(struct xt_table_info, entries) \
-			  + nr_cpu_ids * sizeof(char *))
 extern int xt_register_target(struct xt_target *target);
 extern void xt_unregister_target(struct xt_target *target);
 extern int xt_register_targets(struct xt_target *target, unsigned int n);
@@ -242,6 +239,8 @@ extern void xt_unregister_matches(struct xt_match *match, unsigned int n);
 int xt_check_entry_offsets(const void *base, const char *elems,
                            unsigned int target_offset,
                            unsigned int next_offset);
+
+int xt_check_proc_name(const char *name, unsigned int size);
 
 extern int xt_check_match(struct xt_mtchk_param *,
 			  unsigned int size, u_int8_t proto, bool inv_proto);
@@ -291,6 +290,12 @@ extern void xt_free_table_info(struct xt_table_info *info);
  */
 DECLARE_PER_CPU(seqcount_t, xt_recseq);
 
+/* xt_tee_enabled - true if x_tables needs to handle reentrancy
+ *
+ * Enabled if current ip(6)tables ruleset has at least one -j TEE rule.
+ */
+extern struct static_key xt_tee_enabled;
+
 /**
  * xt_write_recseq_begin - start of a write section
  *
@@ -317,7 +322,7 @@ static inline unsigned int xt_write_recseq_begin(void)
 	 * since addend is most likely 1
 	 */
 	__this_cpu_add(xt_recseq.sequence, addend);
-	smp_wmb();
+	smp_mb();
 
 	return addend;
 }
@@ -358,6 +363,33 @@ static inline unsigned long ifname_compare_aligned(const char *_a,
 		ret |= (a[3] ^ b[3]) & mask[3];
 	BUILD_BUG_ON(IFNAMSIZ > 4 * sizeof(unsigned long));
 	return ret;
+}
+
+struct xt_percpu_counter_alloc_state {
+	unsigned int off;
+	const char __percpu *mem;
+};
+
+bool xt_percpu_counter_alloc(struct xt_percpu_counter_alloc_state *state,
+			     struct xt_counters *counter);
+void xt_percpu_counter_free(struct xt_counters *cnt);
+
+static inline struct xt_counters *
+xt_get_this_cpu_counter(struct xt_counters *cnt)
+{
+	if (nr_cpu_ids > 1)
+		return this_cpu_ptr((void __percpu *) (unsigned long) cnt->pcnt);
+
+	return cnt;
+}
+
+static inline struct xt_counters *
+xt_get_per_cpu_counter(struct xt_counters *cnt, unsigned int cpu)
+{
+	if (nr_cpu_ids > 1)
+		return per_cpu_ptr((void __percpu *) (unsigned long) cnt->pcnt, cpu);
+
+	return cnt;
 }
 
 extern struct nf_hook_ops *xt_hook_link(const struct xt_table *, nf_hookfn *);

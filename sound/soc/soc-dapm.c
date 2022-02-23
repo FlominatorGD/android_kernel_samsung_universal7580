@@ -261,6 +261,7 @@ static void dapm_reset(struct snd_soc_card *card)
 	memset(&card->dapm_stats, 0, sizeof(card->dapm_stats));
 
 	list_for_each_entry(w, &card->widgets, list) {
+		w->new_power = w->power;
 		w->power_checked = false;
 		w->inputs = -1;
 		w->outputs = -1;
@@ -1157,21 +1158,21 @@ int dapm_regulator_event(struct snd_soc_dapm_widget *w,
 	int ret;
 
 	if (SND_SOC_DAPM_EVENT_ON(event)) {
-		if (w->invert & SND_SOC_DAPM_REGULATOR_BYPASS) {
+		if (w->on_val & SND_SOC_DAPM_REGULATOR_BYPASS) {
 			ret = regulator_allow_bypass(w->regulator, false);
 			if (ret != 0)
 				dev_warn(w->dapm->dev,
-					 "ASoC: Failed to bypass %s: %d\n",
+					 "ASoC: Failed to unbypass %s: %d\n",
 					 w->name, ret);
 		}
 
 		return regulator_enable(w->regulator);
 	} else {
-		if (w->invert & SND_SOC_DAPM_REGULATOR_BYPASS) {
+		if (w->on_val & SND_SOC_DAPM_REGULATOR_BYPASS) {
 			ret = regulator_allow_bypass(w->regulator, true);
 			if (ret != 0)
 				dev_warn(w->dapm->dev,
-					 "ASoC: Failed to unbypass %s: %d\n",
+					 "ASoC: Failed to bypass %s: %d\n",
 					 w->name, ret);
 		}
 
@@ -1363,11 +1364,11 @@ static void dapm_seq_check_event(struct snd_soc_dapm_context *dapm,
 		power = 0;
 		break;
 	default:
-		BUG();
+		WARN(1, "Unknown event %d\n", event);
 		return;
 	}
 
-	if (w->power != power)
+	if (w->new_power != power)
 		return;
 
 	if (w->event && (w->event_flags & event)) {
@@ -1388,26 +1389,22 @@ static void dapm_seq_run_coalesced(struct snd_soc_dapm_context *dapm,
 {
 	struct snd_soc_card *card = dapm->card;
 	struct snd_soc_dapm_widget *w;
-	int reg, power;
+	int reg;
 	unsigned int value = 0;
 	unsigned int mask = 0;
-	unsigned int cur_mask;
 
 	reg = list_first_entry(pending, struct snd_soc_dapm_widget,
 			       power_list)->reg;
 
 	list_for_each_entry(w, pending, power_list) {
-		cur_mask = 1 << w->shift;
-		BUG_ON(reg != w->reg);
+		WARN_ON(reg != w->reg);
+		w->power = w->new_power;
 
-		if (w->invert)
-			power = !w->power;
+		mask |= w->mask << w->shift;
+		if (w->power)
+			value |= w->on_val << w->shift;
 		else
-			power = w->power;
-
-		mask |= cur_mask;
-		if (power)
-			value |= cur_mask;
+			value |= w->off_val << w->shift;
 
 		pop_dbg(dapm->dev, card->pop_time,
 			"pop test : Queue %s: reg=0x%x, 0x%x/0x%x\n",
@@ -1698,8 +1695,6 @@ static void dapm_widget_set_power(struct snd_soc_dapm_widget *w, bool power,
 		dapm_seq_insert(w, up_list, true);
 	else
 		dapm_seq_insert(w, down_list, false);
-
-	w->power = power;
 }
 
 static void dapm_power_one_widget(struct snd_soc_dapm_widget *w,
@@ -1775,7 +1770,7 @@ static int dapm_power_widgets(struct snd_soc_dapm_context *dapm, int event)
 			break;
 		}
 
-		if (w->power) {
+		if (w->new_power) {
 			d = w->dapm;
 
 			/* Supplies and micbiases only bring the
@@ -1871,19 +1866,19 @@ static ssize_t dapm_widget_power_read_file(struct file *file,
 	out = is_connected_output_ep(w, NULL);
 	dapm_clear_walk_output(w->dapm, &w->sinks);
 
-	ret = snprintf(buf, PAGE_SIZE, "%s: %s%s  in %d out %d",
+	ret = scnprintf(buf, PAGE_SIZE, "%s: %s%s  in %d out %d",
 		       w->name, w->power ? "On" : "Off",
 		       w->force ? " (forced)" : "", in, out);
 
 	if (w->reg >= 0)
-		ret += snprintf(buf + ret, PAGE_SIZE - ret,
-				" - R%d(0x%x) bit %d",
-				w->reg, w->reg, w->shift);
+		ret += scnprintf(buf + ret, PAGE_SIZE - ret,
+				" - R%d(0x%x) mask 0x%x",
+				w->reg, w->reg, w->mask << w->shift);
 
-	ret += snprintf(buf + ret, PAGE_SIZE - ret, "\n");
+	ret += scnprintf(buf + ret, PAGE_SIZE - ret, "\n");
 
 	if (w->sname)
-		ret += snprintf(buf + ret, PAGE_SIZE - ret, " stream %s %s\n",
+		ret += scnprintf(buf + ret, PAGE_SIZE - ret, " stream %s %s\n",
 				w->sname,
 				w->active ? "active" : "inactive");
 
@@ -1902,7 +1897,7 @@ static ssize_t dapm_widget_power_read_file(struct file *file,
 			continue;
 
 		if (p->connect)
-			ret += snprintf(buf + ret, PAGE_SIZE - ret,
+			ret += scnprintf(buf + ret, PAGE_SIZE - ret,
 					" out \"%s\" \"%s\"\n",
 					p->name ? p->name : "static",
 					p->sink->name);
@@ -1940,7 +1935,7 @@ static ssize_t dapm_bias_read_file(struct file *file, char __user *user_buf,
 		level = "Off\n";
 		break;
 	default:
-		BUG();
+		WARN(1, "Unknown bias_level %d\n", dapm->bias_level);
 		level = "Unknown\n";
 		break;
 	}
@@ -2243,24 +2238,44 @@ static struct snd_soc_dapm_widget *dapm_find_widget(
 	return NULL;
 }
 
-static int snd_soc_dapm_set_pin(struct snd_soc_dapm_context *dapm,
-				const char *pin, int status)
+/*
+ * set the DAPM pin status:
+ * returns 1 when the value has been updated, 0 when unchanged, or a negative
+ * error code; called from kcontrol put callback
+ */
+static int __snd_soc_dapm_set_pin(struct snd_soc_dapm_context *dapm,
+				  const char *pin, int status)
 {
 	struct snd_soc_dapm_widget *w = dapm_find_widget(dapm, pin, true);
+	int ret = 0;
 
 	if (!w) {
 		dev_err(dapm->dev, "ASoC: DAPM unknown pin %s\n", pin);
 		return -EINVAL;
 	}
 
-	if (w->connected != status)
+	if (w->connected != status) {
 		dapm_mark_dirty(w, "pin configuration");
+		ret = 1;
+	}
 
 	w->connected = status;
 	if (status == 0)
 		w->force = 0;
 
-	return 0;
+	return ret;
+}
+
+/*
+ * similar as __snd_soc_dapm_set_pin(), but returns 0 when successful;
+ * called from several API functions below
+ */
+static int snd_soc_dapm_set_pin(struct snd_soc_dapm_context *dapm,
+				const char *pin, int status)
+{
+	int ret = __snd_soc_dapm_set_pin(dapm, pin, status);
+
+	return ret < 0 ? ret : 0;
 }
 
 /**
@@ -2693,12 +2708,9 @@ int snd_soc_dapm_new_widgets(struct snd_soc_dapm_context *dapm)
 
 		/* Read the initial power state from the device */
 		if (w->reg >= 0) {
-			val = soc_widget_read(w, w->reg);
-			val &= 1 << w->shift;
-			if (w->invert)
-				val = !val;
-
-			if (val)
+			val = soc_widget_read(w, w->reg) >> w->shift;
+			val &= w->mask;
+			if (val == w->on_val)
 				w->power = 1;
 		}
 
@@ -3127,18 +3139,15 @@ int snd_soc_dapm_put_pin_switch(struct snd_kcontrol *kcontrol,
 {
 	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
 	const char *pin = (const char *)kcontrol->private_value;
+	int ret;
 
 	mutex_lock_nested(&card->dapm_mutex, SND_SOC_DAPM_CLASS_RUNTIME);
-
-	if (ucontrol->value.integer.value[0])
-		snd_soc_dapm_enable_pin(&card->dapm, pin);
-	else
-		snd_soc_dapm_disable_pin(&card->dapm, pin);
-
+	ret = __snd_soc_dapm_set_pin(&card->dapm, pin,
+				     !!ucontrol->value.integer.value[0]);
 	mutex_unlock(&card->dapm_mutex);
 
 	snd_soc_dapm_sync(&card->dapm);
-	return 0;
+	return ret;
 }
 EXPORT_SYMBOL_GPL(snd_soc_dapm_put_pin_switch);
 
@@ -3163,11 +3172,11 @@ snd_soc_dapm_new_control(struct snd_soc_dapm_context *dapm,
 			return NULL;
 		}
 
-		if (w->invert & SND_SOC_DAPM_REGULATOR_BYPASS) {
+		if (w->on_val & SND_SOC_DAPM_REGULATOR_BYPASS) {
 			ret = regulator_allow_bypass(w->regulator, true);
 			if (ret != 0)
 				dev_warn(w->dapm->dev,
-					 "ASoC: Failed to unbypass %s: %d\n",
+					 "ASoC: Failed to bypass %s: %d\n",
 					 w->name, ret);
 		}
 		break;
@@ -3305,8 +3314,9 @@ static int snd_soc_dai_link_event(struct snd_soc_dapm_widget *w,
 	u64 fmt;
 	int ret;
 
-	BUG_ON(!config);
-	BUG_ON(list_empty(&w->sources) || list_empty(&w->sinks));
+	if (WARN_ON(!config) ||
+	    WARN_ON(list_empty(&w->sources) || list_empty(&w->sinks)))
+		return -EINVAL;
 
 	/* We only support a single source and sink, pick the first */
 	source_p = list_first_entry(&w->sources, struct snd_soc_dapm_path,
@@ -3314,9 +3324,10 @@ static int snd_soc_dai_link_event(struct snd_soc_dapm_widget *w,
 	sink_p = list_first_entry(&w->sinks, struct snd_soc_dapm_path,
 				  list_source);
 
-	BUG_ON(!source_p || !sink_p);
-	BUG_ON(!sink_p->source || !source_p->sink);
-	BUG_ON(!source_p->source || !sink_p->sink);
+	if (WARN_ON(!source_p || !sink_p) ||
+	    WARN_ON(!sink_p->source || !source_p->sink) ||
+	    WARN_ON(!source_p->source || !sink_p->sink))
+		return -EINVAL;
 
 	source = source_p->source->priv;
 	sink = sink_p->sink->priv;
@@ -3392,7 +3403,7 @@ static int snd_soc_dai_link_event(struct snd_soc_dapm_widget *w,
 		break;
 
 	default:
-		BUG();
+		WARN(1, "Unknown event %d\n", event);
 		return -EINVAL;
 	}
 
@@ -3468,6 +3479,16 @@ int snd_soc_dapm_new_dai_widgets(struct snd_soc_dapm_context *dapm,
 			template.name);
 
 		w = snd_soc_dapm_new_control(dapm, &template);
+		if (IS_ERR(w)) {
+			int ret = PTR_ERR(w);
+
+			/* Do not nag about probe deferrals */
+			if (ret != -EPROBE_DEFER)
+				dev_err(dapm->dev,
+				"ASoC: Failed to create %s widget (%d)\n",
+				dai->driver->playback.stream_name, ret);
+			return ret;
+		}
 		if (!w) {
 			dev_err(dapm->dev, "ASoC: Failed to create %s widget\n",
 				dai->driver->playback.stream_name);
@@ -3487,6 +3508,16 @@ int snd_soc_dapm_new_dai_widgets(struct snd_soc_dapm_context *dapm,
 			template.name);
 
 		w = snd_soc_dapm_new_control(dapm, &template);
+		if (IS_ERR(w)) {
+			int ret = PTR_ERR(w);
+
+			/* Do not nag about probe deferrals */
+			if (ret != -EPROBE_DEFER)
+				dev_err(dapm->dev,
+				"ASoC: Failed to create %s widget (%d)\n",
+				dai->driver->playback.stream_name, ret);
+			return ret;
+		}
 		if (!w) {
 			dev_err(dapm->dev, "ASoC: Failed to create %s widget\n",
 				dai->driver->capture.stream_name);
@@ -3515,6 +3546,13 @@ int snd_soc_dapm_link_dai_widgets(struct snd_soc_card *card)
 		case snd_soc_dapm_dai_out:
 			break;
 		default:
+			continue;
+		}
+
+		/* let users know there is no DAI to link */
+		if (!dai_w->priv) {
+			dev_dbg(card->dev, "dai widget %s has no DAI\n",
+				dai_w->name);
 			continue;
 		}
 
@@ -3642,20 +3680,82 @@ void snd_soc_dapm_stream_event(struct snd_soc_pcm_runtime *rtd, int stream,
 }
 
 /**
+ * snd_soc_dapm_enable_pin_unlocked - enable pin.
+ * @dapm: DAPM context
+ * @pin: pin name
+ *
+ * Enables input/output pin and its parents or children widgets iff there is
+ * a valid audio route and active audio stream.
+ *
+ * Requires external locking.
+ *
+ * NOTE: snd_soc_dapm_sync() needs to be called after this for DAPM to
+ * do any widget power switching.
+ */
+int snd_soc_dapm_enable_pin_unlocked(struct snd_soc_dapm_context *dapm,
+				   const char *pin)
+{
+	return snd_soc_dapm_set_pin(dapm, pin, 1);
+}
+EXPORT_SYMBOL_GPL(snd_soc_dapm_enable_pin_unlocked);
+
+/**
  * snd_soc_dapm_enable_pin - enable pin.
  * @dapm: DAPM context
  * @pin: pin name
  *
  * Enables input/output pin and its parents or children widgets iff there is
  * a valid audio route and active audio stream.
+ *
  * NOTE: snd_soc_dapm_sync() needs to be called after this for DAPM to
  * do any widget power switching.
  */
 int snd_soc_dapm_enable_pin(struct snd_soc_dapm_context *dapm, const char *pin)
 {
-	return snd_soc_dapm_set_pin(dapm, pin, 1);
+	int ret;
+
+	mutex_lock_nested(&dapm->card->dapm_mutex, SND_SOC_DAPM_CLASS_RUNTIME);
+
+	ret = snd_soc_dapm_set_pin(dapm, pin, 1);
+
+	mutex_unlock(&dapm->card->dapm_mutex);
+
+	return ret;
 }
 EXPORT_SYMBOL_GPL(snd_soc_dapm_enable_pin);
+
+/**
+ * snd_soc_dapm_force_enable_pin_unlocked - force a pin to be enabled
+ * @dapm: DAPM context
+ * @pin: pin name
+ *
+ * Enables input/output pin regardless of any other state.  This is
+ * intended for use with microphone bias supplies used in microphone
+ * jack detection.
+ *
+ * Requires external locking.
+ *
+ * NOTE: snd_soc_dapm_sync() needs to be called after this for DAPM to
+ * do any widget power switching.
+ */
+int snd_soc_dapm_force_enable_pin_unlocked(struct snd_soc_dapm_context *dapm,
+					 const char *pin)
+{
+	struct snd_soc_dapm_widget *w = dapm_find_widget(dapm, pin, true);
+
+	if (!w) {
+		dev_err(dapm->dev, "ASoC: unknown pin %s\n", pin);
+		return -EINVAL;
+	}
+
+	dev_dbg(w->dapm->dev, "ASoC: force enable pin %s\n", pin);
+	w->connected = 1;
+	w->force = 1;
+	dapm_mark_dirty(w, "force enable");
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(snd_soc_dapm_force_enable_pin_unlocked);
 
 /**
  * snd_soc_dapm_force_enable_pin - force a pin to be enabled
@@ -3672,21 +3772,36 @@ EXPORT_SYMBOL_GPL(snd_soc_dapm_enable_pin);
 int snd_soc_dapm_force_enable_pin(struct snd_soc_dapm_context *dapm,
 				  const char *pin)
 {
-	struct snd_soc_dapm_widget *w = dapm_find_widget(dapm, pin, true);
+	int ret;
 
-	if (!w) {
-		dev_err(dapm->dev, "ASoC: unknown pin %s\n", pin);
-		return -EINVAL;
-	}
+	mutex_lock_nested(&dapm->card->dapm_mutex, SND_SOC_DAPM_CLASS_RUNTIME);
 
-	dev_dbg(w->dapm->dev, "ASoC: force enable pin %s\n", pin);
-	w->connected = 1;
-	w->force = 1;
-	dapm_mark_dirty(w, "force enable");
+	ret = snd_soc_dapm_force_enable_pin_unlocked(dapm, pin);
 
-	return 0;
+	mutex_unlock(&dapm->card->dapm_mutex);
+
+	return ret;
 }
 EXPORT_SYMBOL_GPL(snd_soc_dapm_force_enable_pin);
+
+/**
+ * snd_soc_dapm_disable_pin_unlocked - disable pin.
+ * @dapm: DAPM context
+ * @pin: pin name
+ *
+ * Disables input/output pin and its parents or children widgets.
+ *
+ * Requires external locking.
+ *
+ * NOTE: snd_soc_dapm_sync() needs to be called after this for DAPM to
+ * do any widget power switching.
+ */
+int snd_soc_dapm_disable_pin_unlocked(struct snd_soc_dapm_context *dapm,
+				    const char *pin)
+{
+	return snd_soc_dapm_set_pin(dapm, pin, 0);
+}
+EXPORT_SYMBOL_GPL(snd_soc_dapm_disable_pin_unlocked);
 
 /**
  * snd_soc_dapm_disable_pin - disable pin.
@@ -3694,15 +3809,47 @@ EXPORT_SYMBOL_GPL(snd_soc_dapm_force_enable_pin);
  * @pin: pin name
  *
  * Disables input/output pin and its parents or children widgets.
+ *
  * NOTE: snd_soc_dapm_sync() needs to be called after this for DAPM to
  * do any widget power switching.
  */
 int snd_soc_dapm_disable_pin(struct snd_soc_dapm_context *dapm,
 			     const char *pin)
 {
-	return snd_soc_dapm_set_pin(dapm, pin, 0);
+	int ret;
+
+	mutex_lock_nested(&dapm->card->dapm_mutex, SND_SOC_DAPM_CLASS_RUNTIME);
+
+	ret = snd_soc_dapm_set_pin(dapm, pin, 0);
+
+	mutex_unlock(&dapm->card->dapm_mutex);
+
+	return ret;
 }
 EXPORT_SYMBOL_GPL(snd_soc_dapm_disable_pin);
+
+/**
+ * snd_soc_dapm_nc_pin_unlocked - permanently disable pin.
+ * @dapm: DAPM context
+ * @pin: pin name
+ *
+ * Marks the specified pin as being not connected, disabling it along
+ * any parent or child widgets.  At present this is identical to
+ * snd_soc_dapm_disable_pin() but in future it will be extended to do
+ * additional things such as disabling controls which only affect
+ * paths through the pin.
+ *
+ * Requires external locking.
+ *
+ * NOTE: snd_soc_dapm_sync() needs to be called after this for DAPM to
+ * do any widget power switching.
+ */
+int snd_soc_dapm_nc_pin_unlocked(struct snd_soc_dapm_context *dapm,
+			       const char *pin)
+{
+	return snd_soc_dapm_set_pin(dapm, pin, 0);
+}
+EXPORT_SYMBOL_GPL(snd_soc_dapm_nc_pin_unlocked);
 
 /**
  * snd_soc_dapm_nc_pin - permanently disable pin.
@@ -3720,7 +3867,15 @@ EXPORT_SYMBOL_GPL(snd_soc_dapm_disable_pin);
  */
 int snd_soc_dapm_nc_pin(struct snd_soc_dapm_context *dapm, const char *pin)
 {
-	return snd_soc_dapm_set_pin(dapm, pin, 0);
+	int ret;
+
+	mutex_lock_nested(&dapm->card->dapm_mutex, SND_SOC_DAPM_CLASS_RUNTIME);
+
+	ret = snd_soc_dapm_set_pin(dapm, pin, 0);
+
+	mutex_unlock(&dapm->card->dapm_mutex);
+
+	return ret;
 }
 EXPORT_SYMBOL_GPL(snd_soc_dapm_nc_pin);
 
@@ -3874,7 +4029,7 @@ static void soc_dapm_shutdown_codec(struct snd_soc_dapm_context *dapm)
 			continue;
 		if (w->power) {
 			dapm_seq_insert(w, &down_list, false);
-			w->power = 0;
+			w->new_power = 0;
 			powerdown = 1;
 		}
 	}

@@ -406,7 +406,7 @@ static unsigned long load_elf_interp(struct elfhdr *interp_elf_ex,
 		goto out;
 	if (!elf_check_arch(interp_elf_ex))
 		goto out;
-	if (!interpreter->f_op || !interpreter->f_op->mmap)
+	if (!interpreter->f_op->mmap)
 		goto out;
 
 	/*
@@ -503,28 +503,30 @@ static unsigned long load_elf_interp(struct elfhdr *interp_elf_ex,
 			 * Do the same thing for the memory mapping - between
 			 * elf_bss and last_bss is the bss section.
 			 */
-			k = load_addr + eppnt->p_memsz + eppnt->p_vaddr;
+			k = load_addr + eppnt->p_vaddr + eppnt->p_memsz;
 			if (k > last_bss)
 				last_bss = k;
 		}
 	}
 
+	/*
+	 * Now fill out the bss section: first pad the last page from
+	 * the file up to the page boundary, and zero it from elf_bss
+	 * up to the end of the page.
+	 */
+	if (padzero(elf_bss)) {
+		error = -EFAULT;
+		goto out;
+	}
+	/*
+	 * Next, align both the file and mem bss up to the page size,
+	 * since this is where elf_bss was just zeroed up to, and where
+	 * last_bss will end after the vm_brk() below.
+	 */
+	elf_bss = ELF_PAGEALIGN(elf_bss);
+	last_bss = ELF_PAGEALIGN(last_bss);
+	/* Finally, if there is still more bss to allocate, do it. */
 	if (last_bss > elf_bss) {
-		/*
-		 * Now fill out the bss section.  First pad the last page up
-		 * to the page boundary, and then perform a mmap to make sure
-		 * that there are zero-mapped pages up to and including the
-		 * last bss page.
-		 */
-		if (padzero(elf_bss)) {
-			error = -EFAULT;
-			goto out_close;
-		}
-
-		/* What we have mapped so far */
-		elf_bss = ELF_PAGESTART(elf_bss + ELF_MIN_ALIGN - 1);
-
-		/* Map the last of the bss segment */
 		error = vm_brk(elf_bss, last_bss - elf_bss);
 		if (BAD_ADDR(error))
 			goto out_close;
@@ -607,7 +609,7 @@ static int load_elf_binary(struct linux_binprm *bprm)
 		goto out;
 	if (!elf_check_arch(&loc->elf_ex))
 		goto out;
-	if (!bprm->file->f_op || !bprm->file->f_op->mmap)
+	if (!bprm->file->f_op->mmap)
 		goto out;
 
 	/* Now read in all of the header information */
@@ -1034,7 +1036,7 @@ static int load_elf_library(struct file *file)
 
 	/* First of all, some simple consistency checks */
 	if (elf_ex.e_type != ET_EXEC || elf_ex.e_phnum > 2 ||
-	    !elf_check_arch(&elf_ex) || !file->f_op || !file->f_op->mmap)
+	    !elf_check_arch(&elf_ex) || !file->f_op->mmap)
 		goto out;
 
 	/* Now read in all of the header information */
@@ -1080,11 +1082,13 @@ static int load_elf_library(struct file *file)
 		goto out_free_ph;
 	}
 
-	len = ELF_PAGESTART(eppnt->p_filesz + eppnt->p_vaddr +
-			    ELF_MIN_ALIGN - 1);
-	bss = eppnt->p_memsz + eppnt->p_vaddr;
-	if (bss > len)
-		vm_brk(len, bss - len);
+	len = ELF_PAGEALIGN(eppnt->p_filesz + eppnt->p_vaddr);
+	bss = ELF_PAGEALIGN(eppnt->p_memsz + eppnt->p_vaddr);
+	if (bss > len) {
+		error = vm_brk(len, bss - len);
+		if (BAD_ADDR(error))
+			goto out_free_ph;
+	}
 	error = 0;
 
 out_free_ph:
@@ -1114,6 +1118,14 @@ static bool always_dump_vma(struct vm_area_struct *vma)
 	/* Any vsyscall mappings? */
 	if (vma == get_gate_vma(vma->vm_mm))
 		return true;
+
+	/*
+	 * Assume that all vmas with a .name op should always be dumped.
+	 * If this changes, a new vm_ops field can easily be added.
+	 */
+	if (vma->vm_ops && vma->vm_ops->name && vma->vm_ops->name(vma))
+		return true;
+
 	/*
 	 * arch_vma_name() returns non-NULL for special architecture mappings,
 	 * such as vDSO sections.
@@ -1398,7 +1410,7 @@ static void fill_auxv_note(struct memelfnote *note, struct mm_struct *mm)
 }
 
 static void fill_siginfo_note(struct memelfnote *note, user_siginfo_t *csigdata,
-		siginfo_t *siginfo)
+		const siginfo_t *siginfo)
 {
 	mm_segment_t old_fs = get_fs();
 	set_fs(KERNEL_DS);
@@ -1578,7 +1590,7 @@ static int fill_thread_core_info(struct elf_thread_core_info *t,
 		    (!regset->active || regset->active(t->task, regset))) {
 			int ret;
 			size_t size = regset->n * regset->size;
-			void *data = kmalloc(size, GFP_KERNEL);
+			void *data = kzalloc(size, GFP_KERNEL);
 			if (unlikely(!data))
 				return 0;
 			ret = regset->get(t->task, regset,

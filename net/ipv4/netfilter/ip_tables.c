@@ -102,7 +102,7 @@ ip_packet_match(const struct iphdr *ip,
 	if (FWINV(ret != 0, IPT_INV_VIA_IN)) {
 		dprintf("VIA in mismatch (%s vs %s).%s\n",
 			indev, ipinfo->iniface,
-			ipinfo->invflags&IPT_INV_VIA_IN ?" (INV)":"");
+			ipinfo->invflags & IPT_INV_VIA_IN ? " (INV)" : "");
 		return false;
 	}
 
@@ -111,7 +111,7 @@ ip_packet_match(const struct iphdr *ip,
 	if (FWINV(ret != 0, IPT_INV_VIA_OUT)) {
 		dprintf("VIA out mismatch (%s vs %s).%s\n",
 			outdev, ipinfo->outiface,
-			ipinfo->invflags&IPT_INV_VIA_OUT ?" (INV)":"");
+			ipinfo->invflags & IPT_INV_VIA_OUT ? " (INV)" : "");
 		return false;
 	}
 
@@ -120,7 +120,7 @@ ip_packet_match(const struct iphdr *ip,
 	    FWINV(ip->protocol != ipinfo->proto, IPT_INV_PROTO)) {
 		dprintf("Packet protocol %hi does not match %hi.%s\n",
 			ip->protocol, ipinfo->proto,
-			ipinfo->invflags&IPT_INV_PROTO ? " (INV)":"");
+			ipinfo->invflags & IPT_INV_PROTO ? " (INV)" : "");
 		return false;
 	}
 
@@ -254,15 +254,13 @@ static void trace_packet(const struct sk_buff *skb,
 			 const struct xt_table_info *private,
 			 const struct ipt_entry *e)
 {
-	const void *table_base;
 	const struct ipt_entry *root;
 	const char *hookname, *chainname, *comment;
 	const struct ipt_entry *iter;
 	unsigned int rulenum = 0;
 	struct net *net = dev_net(in ? in : out);
 
-	table_base = private->entries[smp_processor_id()];
-	root = get_entry(table_base, private->hook_entry[hook]);
+	root = get_entry(private->entries, private->hook_entry[hook]);
 
 	hookname = chainname = hooknames[hook];
 	comment = comments[NF_IP_TRACE_COMMENT_RULE];
@@ -278,7 +276,7 @@ static void trace_packet(const struct sk_buff *skb,
 }
 #endif
 
-static inline __pure
+static inline
 struct ipt_entry *ipt_next_entry(const struct ipt_entry *entry)
 {
 	return (void *)entry + entry->next_offset;
@@ -299,12 +297,13 @@ ipt_do_table(struct sk_buff *skb,
 	const char *indev, *outdev;
 	const void *table_base;
 	struct ipt_entry *e, **jumpstack;
-	unsigned int *stackptr, origptr, cpu;
+	unsigned int stackidx, cpu;
 	const struct xt_table_info *private;
 	struct xt_action_param acpar;
 	unsigned int addend;
 
 	/* Initialization */
+	stackidx = 0;
 	ip = ip_hdr(skb);
 	indev = in ? in->name : nulldevname;
 	outdev = out ? out->name : nulldevname;
@@ -327,20 +326,34 @@ ipt_do_table(struct sk_buff *skb,
 	addend = xt_write_recseq_begin();
 	private = table->private;
 	cpu        = smp_processor_id();
-	table_base = private->entries[cpu];
+	/*
+	 * Ensure we load private-> members after we've fetched the base
+	 * pointer.
+	 */
+	smp_read_barrier_depends();
+	table_base = private->entries;
 	jumpstack  = (struct ipt_entry **)private->jumpstack[cpu];
-	stackptr   = per_cpu_ptr(private->stackptr, cpu);
-	origptr    = *stackptr;
+
+	/* Switch to alternate jumpstack if we're being invoked via TEE.
+	 * TEE issues XT_CONTINUE verdict on original skb so we must not
+	 * clobber the jumpstack.
+	 *
+	 * For recursion via REJECT or SYNPROXY the stack will be clobbered
+	 * but it is no problem since absolute verdict is issued by these.
+	 */
+	if (static_key_false(&xt_tee_enabled))
+		jumpstack += private->stacksize * __this_cpu_read(nf_skb_duplicated);
 
 	e = get_entry(table_base, private->hook_entry[hook]);
 
-	pr_debug("Entering %s(hook %u); sp at %u (UF %p)\n",
-		 table->name, hook, origptr,
+	pr_debug("Entering %s(hook %u), UF %p\n",
+		 table->name, hook,
 		 get_entry(table_base, private->underflow[hook]));
 
 	do {
 		const struct xt_entry_target *t;
 		const struct xt_entry_match *ematch;
+		struct xt_counters *counter;
 
 		IP_NF_ASSERT(e);
 		if (!ip_packet_match(ip, indev, outdev,
@@ -357,7 +370,8 @@ ipt_do_table(struct sk_buff *skb,
 				goto no_match;
 		}
 
-		ADD_COUNTER(e->counters, skb->len, 1);
+		counter = xt_get_this_cpu_counter(&e->counters);
+		ADD_COUNTER(*counter, skb->len, 1);
 
 		t = ipt_get_target(e);
 		IP_NF_ASSERT(t->u.kernel.target);
@@ -379,28 +393,28 @@ ipt_do_table(struct sk_buff *skb,
 					verdict = (unsigned int)(-v) - 1;
 					break;
 				}
-				if (*stackptr <= origptr) {
+				if (stackidx == 0) {
 					e = get_entry(table_base,
 					    private->underflow[hook]);
 					pr_debug("Underflow (this is normal) "
 						 "to %p\n", e);
 				} else {
-					e = jumpstack[--*stackptr];
+					e = jumpstack[--stackidx];
 					pr_debug("Pulled %p out from pos %u\n",
-						 e, *stackptr);
+						 e, stackidx);
 					e = ipt_next_entry(e);
 				}
 				continue;
 			}
 			if (table_base + v != ipt_next_entry(e) &&
 			    !(e->ip.flags & IPT_F_GOTO)) {
-				if (*stackptr >= private->stacksize) {
+				if (unlikely(stackidx >= private->stacksize)) {
 					verdict = NF_DROP;
 					break;
 				}
-				jumpstack[(*stackptr)++] = e;
+				jumpstack[stackidx++] = e;
 				pr_debug("Pushed %p into pos %u\n",
-					 e, *stackptr - 1);
+					 e, stackidx - 1);
 			}
 
 			e = get_entry(table_base, v);
@@ -419,9 +433,8 @@ ipt_do_table(struct sk_buff *skb,
 			/* Verdict */
 			break;
 	} while (!acpar.hotdrop);
-	pr_debug("Exiting %s; resetting sp from %u to %u\n",
-		 __func__, *stackptr, origptr);
-	*stackptr = origptr;
+	pr_debug("Exiting %s; sp at %u\n", __func__, stackidx);
+
  	xt_write_recseq_end(addend);
  	local_bh_enable();
 
@@ -543,7 +556,7 @@ mark_source_chains(const struct xt_table_info *newinfo,
 				pos = newpos;
 			}
 		}
-		next:
+next:
 		duprintf("Finished chain %u\n", hook);
 	}
 	return 1;
@@ -630,7 +643,8 @@ static int check_target(struct ipt_entry *e, struct net *net, const char *name)
 
 static int
 find_check_entry(struct ipt_entry *e, struct net *net, const char *name,
-		 unsigned int size)
+		 unsigned int size,
+		 struct xt_percpu_counter_alloc_state *alloc_state)
 {
 	struct xt_entry_target *t;
 	struct xt_target *target;
@@ -638,6 +652,9 @@ find_check_entry(struct ipt_entry *e, struct net *net, const char *name,
 	unsigned int j;
 	struct xt_mtchk_param mtpar;
 	struct xt_entry_match *ematch;
+
+	if (!xt_percpu_counter_alloc(alloc_state, &e->counters))
+		return -ENOMEM;
 
 	j = 0;
 	mtpar.net	= net;
@@ -665,6 +682,7 @@ find_check_entry(struct ipt_entry *e, struct net *net, const char *name,
 	ret = check_target(e, net, name);
 	if (ret)
 		goto err;
+
 	return 0;
  err:
 	module_put(t->u.kernel.target->me);
@@ -674,6 +692,9 @@ find_check_entry(struct ipt_entry *e, struct net *net, const char *name,
 			break;
 		cleanup_match(ematch, net);
 	}
+
+	xt_percpu_counter_free(&e->counters);
+
 	return ret;
 }
 
@@ -768,14 +789,16 @@ cleanup_entry(struct ipt_entry *e, struct net *net)
 	if (par.target->destroy != NULL)
 		par.target->destroy(&par);
 	module_put(par.target->me);
+	xt_percpu_counter_free(&e->counters);
 }
 
 /* Checks and translates the user-supplied table segment (held in
    newinfo) */
 static int
 translate_table(struct net *net, struct xt_table_info *newinfo, void *entry0,
-                const struct ipt_replace *repl)
+		const struct ipt_replace *repl)
 {
+	struct xt_percpu_counter_alloc_state alloc_state = { 0 };
 	struct ipt_entry *iter;
 	unsigned int i;
 	int ret = 0;
@@ -835,7 +858,8 @@ translate_table(struct net *net, struct xt_table_info *newinfo, void *entry0,
 	/* Finally, each sanity check must pass */
 	i = 0;
 	xt_entry_foreach(iter, entry0, newinfo->size) {
-		ret = find_check_entry(iter, net, repl->name, repl->size);
+		ret = find_check_entry(iter, net, repl->name, repl->size,
+				       &alloc_state);
 		if (ret != 0)
 			break;
 		++i;
@@ -848,12 +872,6 @@ translate_table(struct net *net, struct xt_table_info *newinfo, void *entry0,
 			cleanup_entry(iter, net);
 		}
 		return ret;
-	}
-
-	/* And one copy for every other CPU */
-	for_each_possible_cpu(i) {
-		if (newinfo->entries[i] && newinfo->entries[i] != entry0)
-			memcpy(newinfo->entries[i], entry0, newinfo->size);
 	}
 
 	return ret;
@@ -871,14 +889,16 @@ get_counters(const struct xt_table_info *t,
 		seqcount_t *s = &per_cpu(xt_recseq, cpu);
 
 		i = 0;
-		xt_entry_foreach(iter, t->entries[cpu], t->size) {
+		xt_entry_foreach(iter, t->entries, t->size) {
+			struct xt_counters *tmp;
 			u64 bcnt, pcnt;
 			unsigned int start;
 
+			tmp = xt_get_per_cpu_counter(&iter->counters, cpu);
 			do {
 				start = read_seqcount_begin(s);
-				bcnt = iter->counters.bcnt;
-				pcnt = iter->counters.pcnt;
+				bcnt = tmp->bcnt;
+				pcnt = tmp->pcnt;
 			} while (read_seqcount_retry(s, start));
 
 			ADD_COUNTER(counters[i], bcnt, pcnt);
@@ -923,11 +943,7 @@ copy_entries_to_user(unsigned int total_size,
 	if (IS_ERR(counters))
 		return PTR_ERR(counters);
 
-	/* choose the copy that is on our node/cpu, ...
-	 * This choice is lazy (because current thread is
-	 * allowed to migrate to another cpu)
-	 */
-	loc_cpu_entry = private->entries[raw_smp_processor_id()];
+	loc_cpu_entry = private->entries;
 	if (copy_to_user(userptr, loc_cpu_entry, total_size) != 0) {
 		ret = -EFAULT;
 		goto free_counters;
@@ -1035,16 +1051,16 @@ static int compat_table_info(const struct xt_table_info *info,
 			     struct xt_table_info *newinfo)
 {
 	struct ipt_entry *iter;
-	void *loc_cpu_entry;
+	const void *loc_cpu_entry;
 	int ret;
 
 	if (!newinfo || !info)
 		return -EINVAL;
 
-	/* we dont care about newinfo->entries[] */
+	/* we dont care about newinfo->entries */
 	memcpy(newinfo, info, offsetof(struct xt_table_info, entries));
 	newinfo->initial_entries = 0;
-	loc_cpu_entry = info->entries[raw_smp_processor_id()];
+	loc_cpu_entry = info->entries;
 	xt_compat_init_offsets(AF_INET, info->number);
 	xt_entry_foreach(iter, loc_cpu_entry, info->size) {
 		ret = compat_calc_entry(iter, info, loc_cpu_entry, newinfo);
@@ -1056,7 +1072,7 @@ static int compat_table_info(const struct xt_table_info *info,
 #endif
 
 static int get_info(struct net *net, void __user *user,
-                    const int *len, int compat)
+		    const int *len, int compat)
 {
 	char name[XT_TABLE_MAXNAMELEN];
 	struct xt_table *t;
@@ -1135,6 +1151,7 @@ get_entries(struct net *net, struct ipt_get_entries __user *uptr,
 			 *len, sizeof(get) + get.size);
 		return -EINVAL;
 	}
+	get.name[sizeof(get.name) - 1] = '\0';
 
 	t = xt_find_table_lock(net, AF_INET, get.name);
 	if (!IS_ERR_OR_NULL(t)) {
@@ -1165,7 +1182,6 @@ __do_replace(struct net *net, const char *name, unsigned int valid_hooks,
 	struct xt_table *t;
 	struct xt_table_info *oldinfo;
 	struct xt_counters *counters;
-	void *loc_cpu_old_entry;
 	struct ipt_entry *iter;
 
 	ret = 0;
@@ -1208,8 +1224,7 @@ __do_replace(struct net *net, const char *name, unsigned int valid_hooks,
 	get_counters(oldinfo, counters);
 
 	/* Decrease module usage counts and free resource */
-	loc_cpu_old_entry = oldinfo->entries[raw_smp_processor_id()];
-	xt_entry_foreach(iter, loc_cpu_old_entry, oldinfo->size)
+	xt_entry_foreach(iter, oldinfo->entries, oldinfo->size)
 		cleanup_entry(iter, net);
 
 	xt_free_table_info(oldinfo);
@@ -1255,8 +1270,7 @@ do_replace(struct net *net, const void __user *user, unsigned int len)
 	if (!newinfo)
 		return -ENOMEM;
 
-	/* choose the copy that is on our node/cpu */
-	loc_cpu_entry = newinfo->entries[raw_smp_processor_id()];
+	loc_cpu_entry = newinfo->entries;
 	if (copy_from_user(loc_cpu_entry, user + sizeof(tmp),
 			   tmp.size) != 0) {
 		ret = -EFAULT;
@@ -1285,15 +1299,14 @@ do_replace(struct net *net, const void __user *user, unsigned int len)
 
 static int
 do_add_counters(struct net *net, const void __user *user,
-                unsigned int len, int compat)
+		unsigned int len, int compat)
 {
-	unsigned int i, curcpu;
+	unsigned int i;
 	struct xt_counters_info tmp;
 	struct xt_counters *paddc;
 	struct xt_table *t;
 	const struct xt_table_info *private;
 	int ret = 0;
-	void *loc_cpu_entry;
 	struct ipt_entry *iter;
 	unsigned int addend;
 
@@ -1315,12 +1328,12 @@ do_add_counters(struct net *net, const void __user *user,
 	}
 
 	i = 0;
-	/* Choose the copy that is on our node */
-	curcpu = smp_processor_id();
-	loc_cpu_entry = private->entries[curcpu];
 	addend = xt_write_recseq_begin();
-	xt_entry_foreach(iter, loc_cpu_entry, private->size) {
-		ADD_COUNTER(iter->counters, paddc[i].bcnt, paddc[i].pcnt);
+	xt_entry_foreach(iter, private->entries, private->size) {
+		struct xt_counters *tmp;
+
+		tmp = xt_get_this_cpu_counter(&iter->counters);
+		ADD_COUNTER(*tmp, paddc[i].bcnt, paddc[i].pcnt);
 		++i;
 	}
 	xt_write_recseq_end(addend);
@@ -1389,7 +1402,6 @@ compat_copy_entry_to_user(struct ipt_entry *e, void __user **dstptr,
 static int
 compat_find_calc_match(struct xt_entry_match *m,
 		       const struct ipt_ip *ip,
-		       unsigned int hookmask,
 		       int *size)
 {
 	struct xt_match *match;
@@ -1459,8 +1471,7 @@ check_compat_entry_size_and_hooks(struct compat_ipt_entry *e,
 	entry_offset = (void *)e - (void *)base;
 	j = 0;
 	xt_ematch_foreach(ematch, e) {
-		ret = compat_find_calc_match(ematch, &e->ip, e->comefrom,
-					     &off);
+		ret = compat_find_calc_match(ematch, &e->ip, &off);
 		if (ret != 0)
 			goto release_matches;
 		++j;
@@ -1579,12 +1590,14 @@ translate_compat_table(struct net *net,
 	if (!newinfo)
 		goto out_unlock;
 
+	memset(newinfo->entries, 0, size);
+
 	newinfo->number = compatr->num_entries;
 	for (i = 0; i < NF_INET_NUMHOOKS; i++) {
 		newinfo->hook_entry[i] = compatr->hook_entry[i];
 		newinfo->underflow[i] = compatr->underflow[i];
 	}
-	entry1 = newinfo->entries[raw_smp_processor_id()];
+	entry1 = newinfo->entries;
 	pos = entry1;
 	size = compatr->size;
 	xt_entry_foreach(iter0, entry0, compatr->size)
@@ -1660,8 +1673,7 @@ compat_do_replace(struct net *net, void __user *user, unsigned int len)
 	if (!newinfo)
 		return -ENOMEM;
 
-	/* choose the copy that is on our node/cpu */
-	loc_cpu_entry = newinfo->entries[raw_smp_processor_id()];
+	loc_cpu_entry = newinfo->entries;
 	if (copy_from_user(loc_cpu_entry, user + sizeof(tmp),
 			   tmp.size) != 0) {
 		ret = -EFAULT;
@@ -1729,7 +1741,6 @@ compat_copy_entries_to_user(unsigned int total_size, struct xt_table *table,
 	void __user *pos;
 	unsigned int size;
 	int ret = 0;
-	const void *loc_cpu_entry;
 	unsigned int i = 0;
 	struct ipt_entry *iter;
 
@@ -1737,14 +1748,9 @@ compat_copy_entries_to_user(unsigned int total_size, struct xt_table *table,
 	if (IS_ERR(counters))
 		return PTR_ERR(counters);
 
-	/* choose the copy that is on our node/cpu, ...
-	 * This choice is lazy (because current thread is
-	 * allowed to migrate to another cpu)
-	 */
-	loc_cpu_entry = private->entries[raw_smp_processor_id()];
 	pos = userptr;
 	size = total_size;
-	xt_entry_foreach(iter, loc_cpu_entry, total_size) {
+	xt_entry_foreach(iter, private->entries, total_size) {
 		ret = compat_copy_entry_to_user(iter, &pos,
 						&size, counters, i++);
 		if (ret != 0)
@@ -1776,6 +1782,7 @@ compat_get_entries(struct net *net, struct compat_ipt_get_entries __user *uptr,
 			 *len, sizeof(get) + get.size);
 		return -EINVAL;
 	}
+	get.name[sizeof(get.name) - 1] = '\0';
 
 	xt_compat_lock(AF_INET);
 	t = xt_find_table_lock(net, AF_INET, get.name);
@@ -1919,8 +1926,7 @@ struct xt_table *ipt_register_table(struct net *net,
 		goto out;
 	}
 
-	/* choose the copy on our node/cpu, but dont care about preemption */
-	loc_cpu_entry = newinfo->entries[raw_smp_processor_id()];
+	loc_cpu_entry = newinfo->entries;
 	memcpy(loc_cpu_entry, repl->entries, repl->size);
 
 	ret = translate_table(net, newinfo, loc_cpu_entry, repl);
@@ -1951,7 +1957,7 @@ void ipt_unregister_table(struct net *net, struct xt_table *table)
 	private = xt_unregister_table(table);
 
 	/* Decrease module usage counts and free resources */
-	loc_cpu_entry = private->entries[raw_smp_processor_id()];
+	loc_cpu_entry = private->entries;
 	xt_entry_foreach(iter, loc_cpu_entry, private->size)
 		cleanup_entry(iter, net);
 	if (private->number > private->initial_entries)

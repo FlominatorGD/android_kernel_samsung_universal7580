@@ -414,9 +414,9 @@ static int btree_read_extent_buffer_pages(struct btrfs_root *root,
 	int mirror_num = 0;
 	int failed_mirror = 0;
 
-	clear_bit(EXTENT_BUFFER_CORRUPT, &eb->bflags);
 	io_tree = &BTRFS_I(root->fs_info->btree_inode)->io_tree;
 	while (1) {
+		clear_bit(EXTENT_BUFFER_CORRUPT, &eb->bflags);
 		ret = read_extent_buffer_pages(io_tree, eb, start,
 					       WAIT_COMPLETE,
 					       btree_get_extent, mirror_num);
@@ -427,14 +427,6 @@ static int btree_read_extent_buffer_pages(struct btrfs_root *root,
 			else
 				ret = -EIO;
 		}
-
-		/*
-		 * This buffer's crc is fine, but its contents are corrupted, so
-		 * there is no reason to read the other copies, they won't be
-		 * any less wrong.
-		 */
-		if (test_bit(EXTENT_BUFFER_CORRUPT, &eb->bflags))
-			break;
 
 		num_copies = btrfs_num_copies(root->fs_info,
 					      eb->start, eb->len);
@@ -576,8 +568,9 @@ static noinline int check_leaf(struct btrfs_root *root,
 	return 0;
 }
 
-static int btree_readpage_end_io_hook(struct page *page, u64 start, u64 end,
-			       struct extent_state *state, int mirror)
+static int btree_readpage_end_io_hook(struct btrfs_io_bio *io_bio,
+				      u64 phy_offset, struct page *page,
+				      u64 start, u64 end, int mirror)
 {
 	struct extent_io_tree *tree;
 	u64 found_start;
@@ -853,20 +846,17 @@ int btrfs_wq_submit_bio(struct btrfs_fs_info *fs_info, struct inode *inode,
 
 static int btree_csum_one_bio(struct bio *bio)
 {
-	struct bio_vec *bvec = bio->bi_io_vec;
-	int bio_index = 0;
+	struct bio_vec *bvec;
 	struct btrfs_root *root;
-	int ret = 0;
+	int i, ret = 0;
 
-	WARN_ON(bio->bi_vcnt <= 0);
-	while (bio_index < bio->bi_vcnt) {
+	bio_for_each_segment_all(bvec, bio, i) {
 		root = BTRFS_I(bvec->bv_page->mapping->host)->root;
 		ret = csum_dirty_buffer(root, bvec->bv_page);
 		if (ret)
 			break;
-		bio_index++;
-		bvec++;
 	}
+
 	return ret;
 }
 
@@ -1013,7 +1003,8 @@ static int btree_releasepage(struct page *page, gfp_t gfp_flags)
 	return try_release_extent_buffer(page);
 }
 
-static void btree_invalidatepage(struct page *page, unsigned long offset)
+static void btree_invalidatepage(struct page *page, unsigned int offset,
+				 unsigned int length)
 {
 	struct extent_io_tree *tree;
 	tree = &BTRFS_I(page->mapping->host)->io_tree;
@@ -1623,7 +1614,7 @@ static int btrfs_congested_fn(void *congested_data, int bdi_bits)
 		if (!device->bdev)
 			continue;
 		bdi = blk_get_backing_dev_info(device->bdev);
-		if (bdi && bdi_congested(bdi, bdi_bits)) {
+		if (bdi_congested(bdi, bdi_bits)) {
 			ret = 1;
 			break;
 		}
@@ -2238,7 +2229,7 @@ int open_ctree(struct super_block *sb,
 	       sizeof(struct btrfs_key));
 	set_bit(BTRFS_INODE_DUMMY,
 		&BTRFS_I(fs_info->btree_inode)->runtime_flags);
-	insert_inode_hash(fs_info->btree_inode);
+	btrfs_insert_inode_hash(fs_info->btree_inode);
 
 	spin_lock_init(&fs_info->block_group_cache_lock);
 	fs_info->block_group_cache_tree = RB_ROOT;

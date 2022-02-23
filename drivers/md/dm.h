@@ -71,7 +71,6 @@ unsigned dm_table_get_type(struct dm_table *t);
 struct target_type *dm_table_get_immutable_target_type(struct dm_table *t);
 bool dm_table_request_based(struct dm_table *t);
 bool dm_table_supports_discards(struct dm_table *t);
-int dm_table_alloc_md_mempools(struct dm_table *t);
 void dm_table_free_md_mempools(struct dm_table *t);
 struct dm_md_mempools *dm_table_get_md_mempools(struct dm_table *t);
 
@@ -91,9 +90,20 @@ int dm_setup_md_queue(struct mapped_device *md);
 #define dm_target_is_valid(t) ((t)->table)
 
 /*
+ * To check whether the target type is bio-based or not (request-based).
+ */
+#define dm_target_bio_based(t) ((t)->type->map != NULL)
+
+/*
  * To check whether the target type is request-based or not (bio-based).
  */
 #define dm_target_request_based(t) ((t)->type->map_rq != NULL)
+
+/*
+ * To check whether the target type is a hybrid (capable of being
+ * either request-based or bio-based).
+ */
+#define dm_target_hybrid(t) (dm_target_bio_based(t) && dm_target_request_based(t))
 
 /*-----------------------------------------------------------------
  * A registry of target types.

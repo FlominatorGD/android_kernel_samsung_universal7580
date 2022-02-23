@@ -86,14 +86,6 @@ xfs_destroy_ioend(
 		bh->b_end_io(bh, !ioend->io_error);
 	}
 
-	if (ioend->io_iocb) {
-		inode_dio_done(ioend->io_inode);
-		if (ioend->io_isasync) {
-			aio_complete(ioend->io_iocb, ioend->io_error ?
-					ioend->io_error : ioend->io_result, 0);
-		}
-	}
-
 	mempool_free(ioend, xfs_ioend_pool);
 }
 
@@ -290,7 +282,6 @@ xfs_alloc_ioend(
 	 * all the I/O from calling the completion routine too early.
 	 */
 	atomic_set(&ioend->io_remaining, 1);
-	ioend->io_isasync = 0;
 	ioend->io_isdirect = 0;
 	ioend->io_error = 0;
 	ioend->io_list = NULL;
@@ -300,8 +291,6 @@ xfs_alloc_ioend(
 	ioend->io_buffer_tail = NULL;
 	ioend->io_offset = 0;
 	ioend->io_size = 0;
-	ioend->io_iocb = NULL;
-	ioend->io_result = 0;
 	ioend->io_append_trans = NULL;
 
 	INIT_WORK(&ioend->io_work, xfs_end_io);
@@ -852,10 +841,11 @@ xfs_cluster_write(
 STATIC void
 xfs_vm_invalidatepage(
 	struct page		*page,
-	unsigned long		offset)
+	unsigned int		offset,
+	unsigned int		length)
 {
 	trace_xfs_invalidatepage(page->mapping->host, page, offset);
-	block_invalidatepage(page, offset);
+	block_invalidatepage(page, offset, PAGE_CACHE_SIZE - offset);
 }
 
 /*
@@ -919,7 +909,7 @@ next_buffer:
 
 	xfs_iunlock(ip, XFS_ILOCK_EXCL);
 out_invalidate:
-	xfs_vm_invalidatepage(page, 0);
+	xfs_vm_invalidatepage(page, 0, PAGE_CACHE_SIZE);
 	return;
 }
 
@@ -1246,6 +1236,26 @@ __xfs_get_blocks(
 	if (error)
 		goto out_unlock;
 
+	/*
+	 * The only time we can ever safely find delalloc blocks on direct I/O
+	 * is a dio write to post-eof speculative preallocation. All other
+	 * scenarios are indicative of a problem or misuse (such as mixing
+	 * direct and mapped I/O).
+	 *
+	 * The file may be unmapped by the time we get here so we cannot
+	 * reliably fail the I/O based on mapping. Instead, fail the I/O if this
+	 * is a read or a write within eof. Otherwise, carry on but warn as a
+	 * precuation if the file happens to be mapped.
+	 */
+	if (direct && imap.br_startblock == DELAYSTARTBLOCK) {
+	        if (!create || offset < i_size_read(VFS_I(ip))) {
+	                WARN_ON_ONCE(1);
+	                error = -EIO;
+	                goto out_unlock;
+	        }
+	        WARN_ON_ONCE(mapping_mapped(VFS_I(ip)->i_mapping));
+	}
+
 	if (create &&
 	    (!nimaps ||
 	     (imap.br_startblock == HOLESTARTBLOCK ||
@@ -1299,8 +1309,10 @@ __xfs_get_blocks(
 		if (create || !ISUNWRITTEN(&imap))
 			xfs_map_buffer(inode, bh_result, &imap, offset);
 		if (create && ISUNWRITTEN(&imap)) {
-			if (direct)
+			if (direct) {
 				bh_result->b_private = inode;
+				set_buffer_defer_completion(bh_result);
+			}
 			set_buffer_unwritten(bh_result);
 		}
 	}
@@ -1327,7 +1339,6 @@ __xfs_get_blocks(
 		set_buffer_new(bh_result);
 
 	if (imap.br_startblock == DELAYSTARTBLOCK) {
-		BUG_ON(direct);
 		if (create) {
 			set_buffer_uptodate(bh_result);
 			set_buffer_mapped(bh_result);
@@ -1397,9 +1408,7 @@ xfs_end_io_direct_write(
 	struct kiocb		*iocb,
 	loff_t			offset,
 	ssize_t			size,
-	void			*private,
-	int			ret,
-	bool			is_async)
+	void			*private)
 {
 	struct xfs_ioend	*ioend = iocb->private;
 
@@ -1421,17 +1430,10 @@ xfs_end_io_direct_write(
 
 	ioend->io_offset = offset;
 	ioend->io_size = size;
-	ioend->io_iocb = iocb;
-	ioend->io_result = ret;
 	if (private && size > 0)
 		ioend->io_type = XFS_IO_UNWRITTEN;
 
-	if (is_async) {
-		ioend->io_isasync = 1;
-		xfs_finish_ioend(ioend);
-	} else {
-		xfs_finish_ioend_sync(ioend);
-	}
+	xfs_finish_ioend_sync(ioend);
 }
 
 STATIC ssize_t
@@ -1594,7 +1596,7 @@ xfs_vm_write_begin(
 		unlock_page(page);
 
 		if (pos + len > i_size_read(inode))
-			truncate_pagecache(inode, pos + len, i_size_read(inode));
+			truncate_pagecache(inode, i_size_read(inode));
 
 		page_cache_release(page);
 		page = NULL;
@@ -1630,7 +1632,7 @@ xfs_vm_write_end(
 		loff_t		to = pos + len;
 
 		if (to > isize) {
-			truncate_pagecache(inode, to, isize);
+			truncate_pagecache(inode, isize);
 			xfs_vm_kill_delalloc_range(inode, isize, to);
 		}
 	}

@@ -1252,7 +1252,7 @@ static struct regulator *_regulator_get(struct device *dev, const char *id,
 	struct regulator_dev *rdev;
 	struct regulator *regulator = ERR_PTR(-EPROBE_DEFER);
 	const char *devname = NULL;
-	int ret = 0;
+	int ret = -EPROBE_DEFER;
 
 	if (id == NULL) {
 		pr_err("get() with no identifier\n");
@@ -3631,7 +3631,7 @@ regulator_register(const struct regulator_desc *regulator_desc,
 
 	/* register with sysfs */
 	rdev->dev.class = &regulator_class;
-	rdev->dev.of_node = config->of_node;
+	rdev->dev.of_node = of_node_get(config->of_node);
 	rdev->dev.parent = dev;
 	dev_set_name(&rdev->dev, "regulator.%d",
 		     atomic_inc_return(&regulator_no) - 1);
@@ -3754,8 +3754,11 @@ void regulator_unregister(struct regulator_dev *rdev)
 	if (rdev == NULL)
 		return;
 
-	if (rdev->supply)
+	if (rdev->supply) {
+		while (rdev->use_count--)
+			regulator_disable(rdev->supply);
 		regulator_put(rdev->supply);
+	}
 	mutex_lock(&regulator_list_mutex);
 	debugfs_remove_recursive(rdev->debugfs);
 	flush_work(&rdev->disable_work.work);
@@ -3764,6 +3767,7 @@ void regulator_unregister(struct regulator_dev *rdev)
 	list_del(&rdev->list);
 	kfree(rdev->constraints);
 	regulator_ena_gpio_free(rdev);
+	of_node_put(rdev->dev.of_node);
 	device_unregister(&rdev->dev);
 	mutex_unlock(&regulator_list_mutex);
 }

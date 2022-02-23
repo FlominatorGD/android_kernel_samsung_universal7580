@@ -133,16 +133,16 @@
 #endif
 
 /*
- * fd "private" POSIX locks.
+ * Open File Description Locks
  *
- * Usually POSIX locks held by a process are released on *any* close and are
+ * Usually record locks held by a process are released on *any* close and are
  * not inherited across a fork().
  *
- * These cmd values will set locks that conflict with normal POSIX locks, but
- * are "owned" by the opened file, not the process. This means that they are
- * inherited across fork() like BSD (flock) locks, and they are only released
- * automatically when the last reference to the the open file against which
- * they were acquired is put.
+ * These cmd values will set locks that conflict with process-associated
+ * record  locks, but are "owned" by the open file description, not the
+ * process. This means that they are inherited across fork() like BSD (flock)
+ * locks, and they are only released automatically when the last reference to
+ * the the open file against which they were acquired is put.
  */
 #define F_OFD_GETLK	36
 #define F_OFD_SETLK	37
@@ -202,8 +202,6 @@ struct flock {
 };
 #endif
 
-#ifndef CONFIG_64BIT
-
 #ifndef HAVE_ARCH_STRUCT_FLOCK64
 #ifndef __ARCH_FLOCK64_PAD
 #define __ARCH_FLOCK64_PAD
@@ -218,6 +216,5 @@ struct flock64 {
 	__ARCH_FLOCK64_PAD
 };
 #endif
-#endif /* !CONFIG_64BIT */
 
 #endif /* _ASM_GENERIC_FCNTL_H */

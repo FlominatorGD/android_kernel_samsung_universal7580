@@ -69,7 +69,7 @@ typedef union ktime ktime_t;		/* Kill this */
  * @secs:	seconds to set
  * @nsecs:	nanoseconds to set
  *
- * Return the ktime_t representation of the value
+ * Return: The ktime_t representation of the value.
  */
 static inline ktime_t ktime_set(const long secs, const unsigned long nsecs)
 {
@@ -87,6 +87,13 @@ static inline ktime_t ktime_set(const long secs, const unsigned long nsecs)
 /* Add two ktime_t variables. res = lhs + rhs: */
 #define ktime_add(lhs, rhs) \
 		({ (ktime_t){ .tv64 = (lhs).tv64 + (rhs).tv64 }; })
+
+/*
+ * Same as ktime_add(), but avoids undefined behaviour on overflow; however,
+ * this means that you must check the result for overflow yourself.
+ */
+#define ktime_add_unsafe(lhs, rhs) \
+		({ (ktime_t){ .tv64 = (u64) (lhs).tv64 + (rhs).tv64 }; })
 
 /*
  * Add a ktime_t variable and a scalar nanosecond value.
@@ -108,6 +115,12 @@ static inline ktime_t timespec_to_ktime(struct timespec ts)
 	return ktime_set(ts.tv_sec, ts.tv_nsec);
 }
 
+/* convert a timespec64 to ktime_t format: */
+static inline ktime_t timespec64_to_ktime(struct timespec64 ts)
+{
+	return ktime_set(ts.tv_sec, ts.tv_nsec);
+}
+
 /* convert a timeval to ktime_t format: */
 static inline ktime_t timeval_to_ktime(struct timeval tv)
 {
@@ -116,6 +129,9 @@ static inline ktime_t timeval_to_ktime(struct timeval tv)
 
 /* Map the ktime_t to timespec conversion to ns_to_timespec function */
 #define ktime_to_timespec(kt)		ns_to_timespec((kt).tv64)
+
+/* Map the ktime_t to timespec conversion to ns_to_timespec function */
+#define ktime_to_timespec64(kt)		ns_to_timespec64((kt).tv64)
 
 /* Map the ktime_t to timeval conversion to ns_to_timeval function */
 #define ktime_to_timeval(kt)		ns_to_timeval((kt).tv64)
@@ -151,7 +167,7 @@ static inline ktime_t ktime_set(const long secs, const unsigned long nsecs)
  * @lhs:	minuend
  * @rhs:	subtrahend
  *
- * Returns the remainder of the subtraction
+ * Return: The remainder of the subtraction.
  */
 static inline ktime_t ktime_sub(const ktime_t lhs, const ktime_t rhs)
 {
@@ -169,7 +185,7 @@ static inline ktime_t ktime_sub(const ktime_t lhs, const ktime_t rhs)
  * @add1:	addend1
  * @add2:	addend2
  *
- * Returns the sum of @add1 and @add2.
+ * Return: The sum of @add1 and @add2.
  */
 static inline ktime_t ktime_add(const ktime_t add1, const ktime_t add2)
 {
@@ -195,7 +211,7 @@ static inline ktime_t ktime_add(const ktime_t add1, const ktime_t add2)
  * @kt:		addend
  * @nsec:	the scalar nsec value to add
  *
- * Returns the sum of @kt and @nsec in ktime_t format
+ * Return: The sum of @kt and @nsec in ktime_t format.
  */
 extern ktime_t ktime_add_ns(const ktime_t kt, u64 nsec);
 
@@ -204,7 +220,7 @@ extern ktime_t ktime_add_ns(const ktime_t kt, u64 nsec);
  * @kt:		minuend
  * @nsec:	the scalar nsec value to subtract
  *
- * Returns the subtraction of @nsec from @kt in ktime_t format
+ * Return: The subtraction of @nsec from @kt in ktime_t format.
  */
 extern ktime_t ktime_sub_ns(const ktime_t kt, u64 nsec);
 
@@ -212,7 +228,7 @@ extern ktime_t ktime_sub_ns(const ktime_t kt, u64 nsec);
  * timespec_to_ktime - convert a timespec to ktime_t format
  * @ts:		the timespec variable to convert
  *
- * Returns a ktime_t variable with the converted timespec value
+ * Return: A ktime_t variable with the converted timespec value.
  */
 static inline ktime_t timespec_to_ktime(const struct timespec ts)
 {
@@ -224,7 +240,7 @@ static inline ktime_t timespec_to_ktime(const struct timespec ts)
  * timeval_to_ktime - convert a timeval to ktime_t format
  * @tv:		the timeval variable to convert
  *
- * Returns a ktime_t variable with the converted timeval value
+ * Return: A ktime_t variable with the converted timeval value.
  */
 static inline ktime_t timeval_to_ktime(const struct timeval tv)
 {
@@ -236,7 +252,7 @@ static inline ktime_t timeval_to_ktime(const struct timeval tv)
  * ktime_to_timespec - convert a ktime_t variable to timespec format
  * @kt:		the ktime_t variable to convert
  *
- * Returns the timespec representation of the ktime value
+ * Return: The timespec representation of the ktime value.
  */
 static inline struct timespec ktime_to_timespec(const ktime_t kt)
 {
@@ -248,7 +264,7 @@ static inline struct timespec ktime_to_timespec(const ktime_t kt)
  * ktime_to_timeval - convert a ktime_t variable to timeval format
  * @kt:		the ktime_t variable to convert
  *
- * Returns the timeval representation of the ktime value
+ * Return: The timeval representation of the ktime value.
  */
 static inline struct timeval ktime_to_timeval(const ktime_t kt)
 {
@@ -261,7 +277,7 @@ static inline struct timeval ktime_to_timeval(const ktime_t kt)
  * ktime_to_ns - convert a ktime_t variable to scalar nanoseconds
  * @kt:		the ktime_t variable to convert
  *
- * Returns the scalar nanoseconds representation of @kt
+ * Return: The scalar nanoseconds representation of @kt.
  */
 static inline s64 ktime_to_ns(const ktime_t kt)
 {
@@ -275,7 +291,9 @@ static inline s64 ktime_to_ns(const ktime_t kt)
  * @cmp1:	comparable1
  * @cmp2:	comparable2
  *
- * Compare two ktime_t variables, returns 1 if equal
+ * Compare two ktime_t variables.
+ *
+ * Return: 1 if equal.
  */
 static inline int ktime_equal(const ktime_t cmp1, const ktime_t cmp2)
 {
@@ -287,7 +305,7 @@ static inline int ktime_equal(const ktime_t cmp1, const ktime_t cmp2)
  * @cmp1:	comparable1
  * @cmp2:	comparable2
  *
- * Returns ...
+ * Return: ...
  *   cmp1  < cmp2: return <0
  *   cmp1 == cmp2: return 0
  *   cmp1  > cmp2: return >0
@@ -299,6 +317,30 @@ static inline int ktime_compare(const ktime_t cmp1, const ktime_t cmp2)
 	if (cmp1.tv64 > cmp2.tv64)
 		return 1;
 	return 0;
+}
+
+/**
+ * ktime_after - Compare if a ktime_t value is bigger than another one.
+ * @cmp1:	comparable1
+ * @cmp2:	comparable2
+ *
+ * Return: true if cmp1 happened after cmp2.
+ */
+static inline bool ktime_after(const ktime_t cmp1, const ktime_t cmp2)
+{
+	return ktime_compare(cmp1, cmp2) > 0;
+}
+
+/**
+ * ktime_before - Compare if a ktime_t value is smaller than another one.
+ * @cmp1:	comparable1
+ * @cmp2:	comparable2
+ *
+ * Return: true if cmp1 happened before cmp2.
+ */
+static inline bool ktime_before(const ktime_t cmp1, const ktime_t cmp2)
+{
+	return ktime_compare(cmp1, cmp2) < 0;
 }
 
 #if BITS_PER_LONG < 64
@@ -365,12 +407,31 @@ extern ktime_t ktime_add_safe(const ktime_t lhs, const ktime_t rhs);
  * @kt:		the ktime_t variable to convert
  * @ts:		the timespec variable to store the result in
  *
- * Returns true if there was a successful conversion, false if kt was 0.
+ * Return: %true if there was a successful conversion, %false if kt was 0.
  */
 static inline bool ktime_to_timespec_cond(const ktime_t kt, struct timespec *ts)
 {
 	if (kt.tv64) {
 		*ts = ktime_to_timespec(kt);
+		return true;
+	} else {
+		return false;
+	}
+}
+
+/**
+ * ktime_to_timespec64_cond - convert a ktime_t variable to timespec64
+ *			    format only if the variable contains data
+ * @kt:		the ktime_t variable to convert
+ * @ts:		the timespec variable to store the result in
+ *
+ * Return: %true if there was a successful conversion, %false if kt was 0.
+ */
+static inline __must_check bool ktime_to_timespec64_cond(const ktime_t kt,
+						       struct timespec64 *ts)
+{
+	if (kt.tv64) {
+		*ts = ktime_to_timespec64(kt);
 		return true;
 	} else {
 		return false;

@@ -143,6 +143,14 @@ static const struct usb_device_id usb_quirk_list[] = {
 	/* M-Systems Flash Disk Pioneers */
 	{ USB_DEVICE(0x08ec, 0x1000), .driver_info = USB_QUIRK_RESET_RESUME },
 
+	/* Baum Vario Ultra */
+	{ USB_DEVICE(0x0904, 0x6101), .driver_info =
+			USB_QUIRK_LINEAR_FRAME_INTR_BINTERVAL },
+	{ USB_DEVICE(0x0904, 0x6102), .driver_info =
+			USB_QUIRK_LINEAR_FRAME_INTR_BINTERVAL },
+	{ USB_DEVICE(0x0904, 0x6103), .driver_info =
+			USB_QUIRK_LINEAR_FRAME_INTR_BINTERVAL },
+
 	/* Keytouch QWERTY Panel keyboard */
 	{ USB_DEVICE(0x0926, 0x3333), .driver_info =
 			USB_QUIRK_CONFIG_INTF_STRINGS },
@@ -162,6 +170,13 @@ static const struct usb_device_id usb_quirk_list[] = {
 
 	/* SKYMEDI USB_DRIVE */
 	{ USB_DEVICE(0x1516, 0x8628), .driver_info = USB_QUIRK_RESET_RESUME },
+
+	/* Razer - Razer Blade Keyboard */
+	{ USB_DEVICE(0x1532, 0x0116), .driver_info =
+			USB_QUIRK_LINEAR_UFRAME_INTR_BINTERVAL },
+
+	/* Lenovo ThinkPad USB-C Dock Gen2 Ethernet (RTL8153 GigE) */
+	{ USB_DEVICE(0x17ef, 0xa387), .driver_info = USB_QUIRK_NO_LPM },
 
 	/* BUILDWIN Photo Frame */
 	{ USB_DEVICE(0x1908, 0x1315), .driver_info =

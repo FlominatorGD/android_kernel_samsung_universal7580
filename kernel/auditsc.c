@@ -1364,9 +1364,6 @@ static void audit_log_exit(struct audit_context *context, struct task_struct *ts
 	/* tsk == current */
 	context->personality = tsk->personality;
 
-// [ SEC_SELINUX_PORTING_COMMON
-	if (context->major != __NR_setsockopt  && context->major != 294 ) {
-// ] SEC_SELINUX_PORTING_COMMON
 	ab = audit_log_start(context, GFP_KERNEL, AUDIT_SYSCALL);
 	if (!ab)
 		return;		/* audit_panic has been called */
@@ -1390,7 +1387,6 @@ static void audit_log_exit(struct audit_context *context, struct task_struct *ts
 	audit_log_task_info(ab, tsk);
 	audit_log_key(ab, context->filterkey);
 	audit_log_end(ab);
-	
 
 	for (aux = context->aux; aux; aux = aux->next) {
 
@@ -1481,9 +1477,7 @@ static void audit_log_exit(struct audit_context *context, struct task_struct *ts
 	}
 
 	audit_log_proctitle(tsk, context);
-// [ SEC_SELINUX_PORTING_COMMON
-	} // End of context->major != __NR_setsockopt
-// ] SEC_SELINUX_PORTING_COMMON
+
 	/* Send end of event record to help user space know we are finished */
 	ab = audit_log_start(context, GFP_KERNEL, AUDIT_EOE);
 	if (ab)
@@ -1815,7 +1809,7 @@ void audit_putname(struct filename *name)
 	struct audit_context *context = current->audit_context;
 
 	BUG_ON(!context);
-	if (!context->in_syscall) {
+	if (!name->aname || !context->in_syscall) {
 #if AUDIT_DEBUG == 2
 		printk(KERN_ERR "%s:%d(:%d): final_putname(%p)\n",
 		       __FILE__, __LINE__, context->serial, name);

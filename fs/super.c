@@ -84,13 +84,13 @@ static int prune_super(struct shrinker *shrink, struct shrink_control *sc)
 		int	inodes;
 
 		/* proportion the scan between the caches */
-		dentries = (sc->nr_to_scan * sb->s_nr_dentry_unused) /
-							total_objects;
-		inodes = (sc->nr_to_scan * sb->s_nr_inodes_unused) /
-							total_objects;
+		dentries = mult_frac(sc->nr_to_scan, sb->s_nr_dentry_unused,
+							total_objects);
+		inodes = mult_frac(sc->nr_to_scan, sb->s_nr_inodes_unused,
+							total_objects);
 		if (fs_objects)
-			fs_objects = (sc->nr_to_scan * fs_objects) /
-							total_objects;
+			fs_objects = mult_frac(sc->nr_to_scan, fs_objects,
+							total_objects);
 		/*
 		 * prune the dcache first as the icache is pinned by it, then
 		 * prune the icache, followed by the filesystem specific caches
@@ -106,7 +106,7 @@ static int prune_super(struct shrinker *shrink, struct shrink_control *sc)
 				sb->s_nr_inodes_unused + fs_objects;
 	}
 
-	total_objects = (total_objects / 100) * sysctl_vfs_cache_pressure;
+	total_objects = vfs_pressure_ratio(total_objects);
 	drop_super(sb);
 	return total_objects;
 }
@@ -154,15 +154,9 @@ static struct super_block *alloc_super(struct file_system_type *type, int flags)
 	static const struct super_operations default_op;
 
 	if (s) {
-		if (security_sb_alloc(s)) {
-			/*
-			 * We cannot call security_sb_free() without
-			 * security_sb_alloc() succeeding. So bail out manually
-			 */
-			kfree(s);
-			s = NULL;
-			goto out;
-		}
+		if (security_sb_alloc(s))
+			goto out_free_sb;
+
 		if (init_sb_writers(s, type))
 			goto err_out;
 		s->s_flags = flags;
@@ -198,7 +192,6 @@ static struct super_block *alloc_super(struct file_system_type *type, int flags)
 		lockdep_set_class(&s->s_vfs_rename_mutex, &type->s_vfs_rename_key);
 		mutex_init(&s->s_dquot.dqio_mutex);
 		mutex_init(&s->s_dquot.dqonoff_mutex);
-		init_rwsem(&s->s_dquot.dqptr_sem);
 		s->s_maxbytes = MAX_NON_LFS;
 		s->s_op = &default_op;
 		s->s_time_gran = 1000000000;
@@ -213,6 +206,7 @@ out:
 err_out:
 	security_sb_free(s);
 	destroy_sb_writers(s);
+out_free_sb:
 	kfree(s);
 	s = NULL;
 	goto out;
@@ -395,6 +389,11 @@ void generic_shutdown_super(struct super_block *sb)
 		fsnotify_unmount_inodes(&sb->s_inodes);
 
 		evict_inodes(sb);
+
+		if (sb->s_dio_done_wq) {
+			destroy_workqueue(sb->s_dio_done_wq);
+			sb->s_dio_done_wq = NULL;
+		}
 
 		if (sop->put_super)
 			sop->put_super(sb);
@@ -700,7 +699,6 @@ int do_remount_sb2(struct vfsmount *mnt, struct super_block *sb, int flags, void
 	if (flags & MS_RDONLY)
 		acct_auto_close(sb);
 	shrink_dcache_sb(sb);
-	sync_filesystem(sb);
 
 	remount_ro = (flags & MS_RDONLY) && !(sb->s_flags & MS_RDONLY);
 

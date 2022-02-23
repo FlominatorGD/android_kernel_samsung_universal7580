@@ -37,8 +37,7 @@ isofs_cmp(struct dentry *dentry, const char *compare, int dlen)
 
 	qstr.name = compare;
 	qstr.len = dlen;
-	return dentry->d_op->d_compare(NULL, NULL, NULL, NULL,
-			dentry->d_name.len, dentry->d_name.name, &qstr);
+	return dentry->d_op->d_compare(NULL, NULL, dentry->d_name.len, dentry->d_name.name, &qstr);
 }
 
 /*
@@ -117,6 +116,7 @@ isofs_find_entry(struct inode *dir, struct dentry *dentry,
 			printk(KERN_NOTICE "iso9660: Corrupted directory entry"
 			       " in block %lu of inode %lu\n", block,
 			       dir->i_ino);
+			brelse(bh);
 			return 0;
 		}
 

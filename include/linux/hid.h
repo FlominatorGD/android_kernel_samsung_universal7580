@@ -674,6 +674,8 @@ struct hid_driver {
  *	   shouldn't allocate anything to not leak memory
  * @request: send report request to device (e.g. feature report)
  * @wait: wait for buffered io to complete (send/recv reports)
+ * @raw_request: send raw report request to device (e.g. feature report)
+ * @output_report: send output report to device
  * @idle: send idle request to device
  */
 struct hid_ll_driver {
@@ -694,8 +696,14 @@ struct hid_ll_driver {
 			struct hid_report *report, int reqtype);
 
 	int (*wait)(struct hid_device *hdev);
-	int (*idle)(struct hid_device *hdev, int report, int idle, int reqtype);
 
+	int (*raw_request) (struct hid_device *hdev, unsigned char reportnum,
+			    __u8 *buf, size_t len, unsigned char rtype,
+			    int reqtype);
+
+	int (*output_report) (struct hid_device *hdev, __u8 *buf, size_t len);
+
+	int (*idle)(struct hid_device *hdev, int report, int idle, int reqtype);
 };
 
 #define	PM_HINT_FULLON	1<<5
@@ -809,34 +817,49 @@ static inline void hid_device_io_stop(struct hid_device *hid) {
  * @max: maximal valid usage->code to consider later (out parameter)
  * @type: input event type (EV_KEY, EV_REL, ...)
  * @c: code which corresponds to this usage and type
+ *
+ * The value pointed to by @bit will be set to NULL if either @type is
+ * an unhandled event type, or if @c is out of range for @type. This
+ * can be used as an error condition.
  */
 static inline void hid_map_usage(struct hid_input *hidinput,
 		struct hid_usage *usage, unsigned long **bit, int *max,
-		__u8 type, __u16 c)
+		__u8 type, unsigned int c)
 {
 	struct input_dev *input = hidinput->input;
-
-	usage->type = type;
-	usage->code = c;
+	unsigned long *bmap = NULL;
+	unsigned int limit = 0;
 
 	switch (type) {
 	case EV_ABS:
-		*bit = input->absbit;
-		*max = ABS_MAX;
+		bmap = input->absbit;
+		limit = ABS_MAX;
 		break;
 	case EV_REL:
-		*bit = input->relbit;
-		*max = REL_MAX;
+		bmap = input->relbit;
+		limit = REL_MAX;
 		break;
 	case EV_KEY:
-		*bit = input->keybit;
-		*max = KEY_MAX;
+		bmap = input->keybit;
+		limit = KEY_MAX;
 		break;
 	case EV_LED:
-		*bit = input->ledbit;
-		*max = LED_MAX;
+		bmap = input->ledbit;
+		limit = LED_MAX;
 		break;
 	}
+
+	if (unlikely(c > limit || !bmap)) {
+		pr_warn_ratelimited("%s: Invalid code %d type %d\n",
+				    input->name, c, type);
+		*bit = NULL;
+		return;
+	}
+
+	usage->type = type;
+	usage->code = c;
+	*max = limit;
+	*bit = bmap;
 }
 
 /**
@@ -850,7 +873,8 @@ static inline void hid_map_usage_clear(struct hid_input *hidinput,
 		__u8 type, __u16 c)
 {
 	hid_map_usage(hidinput, usage, bit, max, type, c);
-	clear_bit(c, *bit);
+	if (*bit)
+		clear_bit(usage->code, *bit);
 }
 
 /**
@@ -959,6 +983,49 @@ static inline void hid_hw_request(struct hid_device *hdev,
 {
 	if (hdev->ll_driver->request)
 		hdev->ll_driver->request(hdev, report, reqtype);
+}
+
+/**
+ * hid_hw_raw_request - send report request to device
+ *
+ * @hdev: hid device
+ * @reportnum: report ID
+ * @buf: in/out data to transfer
+ * @len: length of buf
+ * @rtype: HID report type
+ * @reqtype: HID_REQ_GET_REPORT or HID_REQ_SET_REPORT
+ *
+ * @return: count of data transfered, negative if error
+ *
+ * Same behavior as hid_hw_request, but with raw buffers instead.
+ */
+static inline int hid_hw_raw_request(struct hid_device *hdev,
+				  unsigned char reportnum, __u8 *buf,
+				  size_t len, unsigned char rtype, int reqtype)
+{
+	if (hdev->ll_driver->raw_request)
+		return hdev->ll_driver->raw_request(hdev, reportnum, buf, len,
+						    rtype, reqtype);
+
+	return -ENOSYS;
+}
+
+/**
+ * hid_hw_output_report - send output report to device
+ *
+ * @hdev: hid device
+ * @buf: raw data to transfer
+ * @len: length of buf
+ *
+ * @return: count of data transfered, negative if error
+ */
+static inline int hid_hw_output_report(struct hid_device *hdev, __u8 *buf,
+					size_t len)
+{
+	if (hdev->ll_driver->output_report)
+		return hdev->ll_driver->output_report(hdev, buf, len);
+
+	return -ENOSYS;
 }
 
 /**

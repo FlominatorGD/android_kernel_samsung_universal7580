@@ -195,9 +195,10 @@ kill:
 				inet_twsk_put(tw);
 				return TCP_TW_SUCCESS;
 			}
+		} else {
+			inet_twsk_schedule(tw, &tcp_death_row, TCP_TIMEWAIT_LEN,
+					   TCP_TIMEWAIT_LEN);
 		}
-		inet_twsk_schedule(tw, &tcp_death_row, TCP_TIMEWAIT_LEN,
-				   TCP_TIMEWAIT_LEN);
 
 		if (tmp_opt.saw_tstamp) {
 			tcptw->tw_ts_recent	  = tmp_opt.rcv_tsval;
@@ -393,7 +394,7 @@ struct sock *tcp_create_openreq_child(struct sock *sk, struct request_sock *req,
 
 		newtp->rcv_wup = newtp->copied_seq =
 		newtp->rcv_nxt = treq->rcv_isn + 1;
-		newtp->segs_in = 0;
+		newtp->segs_in = 1;
 
 		newtp->snd_sml = newtp->snd_una =
 		newtp->snd_nxt = newtp->snd_up = treq->snt_isn + 1;
@@ -415,6 +416,8 @@ struct sock *tcp_create_openreq_child(struct sock *sk, struct request_sock *req,
 		newtp->snd_ssthresh = TCP_INFINITE_SSTHRESH;
 		tcp_enable_early_retrans(newtp);
 		newtp->tlp_high_seq = 0;
+		newtp->lsndtime = treq->snt_synack;
+		newtp->total_retrans = req->num_retrans;
 
 		/* So many TCP implementations out there (incorrectly) count the
 		 * initial SYN frame in their delayed-ACK and congestion control
@@ -670,12 +673,6 @@ struct sock *tcp_check_req(struct sock *sk, struct sk_buff *skb,
 	if (!(flg & TCP_FLAG_ACK))
 		return NULL;
 
-	/* Got ACK for our SYNACK, so update baseline for SYNACK RTT sample. */
-	if (tmp_opt.saw_tstamp && tmp_opt.rcv_tsecr)
-		tcp_rsk(req)->snt_synack = tmp_opt.rcv_tsecr;
-	else if (req->num_retrans) /* don't take RTT sample if retrans && ~TS */
-		tcp_rsk(req)->snt_synack = 0;
-
 	/* For Fast Open no more processing is needed (sk is the
 	 * child socket).
 	 */
@@ -750,6 +747,7 @@ int tcp_child_process(struct sock *parent, struct sock *child,
 	int ret = 0;
 	int state = child->sk_state;
 
+	tcp_sk(child)->segs_in += max_t(u16, 1, skb_shinfo(skb)->gso_segs);
 	if (!sock_owned_by_user(child)) {
 		ret = tcp_rcv_state_process(child, skb, tcp_hdr(skb),
 					    skb->len);

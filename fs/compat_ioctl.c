@@ -59,7 +59,7 @@
 #include <linux/gfp.h>
 
 #include <net/bluetooth/bluetooth.h>
-#include <net/bluetooth/hci.h>
+#include <net/bluetooth/hci_sock.h>
 #include <net/bluetooth/rfcomm.h>
 
 #include <linux/capi.h>
@@ -1540,9 +1540,10 @@ static int compat_ioctl_check_table(unsigned int xcmd)
 	return ioctl_pointer[i] == xcmd;
 }
 
-asmlinkage long compat_sys_ioctl(unsigned int fd, unsigned int cmd,
-				unsigned long arg)
+COMPAT_SYSCALL_DEFINE3(ioctl, unsigned int, fd, unsigned int, cmd,
+		       compat_ulong_t, arg32)
 {
+	unsigned long arg = arg32;
 	struct fd f = fdget(fd);
 	int error = -EBADF;
 	if (!f.file)
@@ -1586,13 +1587,13 @@ asmlinkage long compat_sys_ioctl(unsigned int fd, unsigned int cmd,
 		/*FALL THROUGH*/
 
 	default:
-		if (f.file->f_op && f.file->f_op->compat_ioctl) {
+		if (f.file->f_op->compat_ioctl) {
 			error = f.file->f_op->compat_ioctl(f.file, cmd, arg);
 			if (error != -ENOIOCTLCMD)
 				goto out_fput;
 		}
 
-		if (!f.file->f_op || !f.file->f_op->unlocked_ioctl)
+		if (!f.file->f_op->unlocked_ioctl)
 			goto do_ioctl;
 		break;
 	}

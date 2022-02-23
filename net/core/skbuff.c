@@ -482,32 +482,33 @@ static void skb_free_head(struct sk_buff *skb)
 
 static void skb_release_data(struct sk_buff *skb)
 {
-	if (!skb->cloned ||
-	    !atomic_sub_return(skb->nohdr ? (1 << SKB_DATAREF_SHIFT) + 1 : 1,
-			       &skb_shinfo(skb)->dataref)) {
-		if (skb_shinfo(skb)->nr_frags) {
-			int i;
-			for (i = 0; i < skb_shinfo(skb)->nr_frags; i++)
-				skb_frag_unref(skb, i);
-		}
+	struct skb_shared_info *shinfo = skb_shinfo(skb);
+	int i;
 
-		/*
-		 * If skb buf is from userspace, we need to notify the caller
-		 * the lower device DMA has done;
-		 */
-		if (skb_shinfo(skb)->tx_flags & SKBTX_DEV_ZEROCOPY) {
-			struct ubuf_info *uarg;
+	if (skb->cloned &&
+	    atomic_sub_return(skb->nohdr ? (1 << SKB_DATAREF_SHIFT) + 1 : 1,
+			      &shinfo->dataref))
+		return;
 
-			uarg = skb_shinfo(skb)->destructor_arg;
-			if (uarg->callback)
-				uarg->callback(uarg, true);
-		}
+	for (i = 0; i < shinfo->nr_frags; i++)
+		__skb_frag_unref(&shinfo->frags[i]);
 
-		if (skb_has_frag_list(skb))
-			skb_drop_fraglist(skb);
+	/*
+	 * If skb buf is from userspace, we need to notify the caller
+	 * the lower device DMA has done;
+	 */
+	if (shinfo->tx_flags & SKBTX_DEV_ZEROCOPY) {
+		struct ubuf_info *uarg;
 
-		skb_free_head(skb);
+		uarg = shinfo->destructor_arg;
+		if (uarg->callback)
+			uarg->callback(uarg, true);
 	}
+
+	if (shinfo->frag_list)
+		kfree_skb_list(shinfo->frag_list);
+
+	skb_free_head(skb);
 }
 
 /*
@@ -1393,6 +1394,21 @@ done:
 	return 0;
 }
 EXPORT_SYMBOL(___pskb_trim);
+
+/* Note : use pskb_trim_rcsum() instead of calling this directly
+ */
+int pskb_trim_rcsum_slow(struct sk_buff *skb, unsigned int len)
+{
+	if (skb->ip_summed == CHECKSUM_COMPLETE) {
+		int delta = skb->len - len;
+
+		skb->csum = csum_block_sub(skb->csum,
+					   skb_checksum(skb, len, delta, 0),
+					   len);
+	}
+	return __pskb_trim(skb, len);
+}
+EXPORT_SYMBOL(pskb_trim_rcsum_slow);
 
 /**
  *	__pskb_pull_tail - advance tail of skb header
@@ -2338,7 +2354,19 @@ EXPORT_SYMBOL(skb_split);
  */
 static int skb_prepare_for_shift(struct sk_buff *skb)
 {
-	return skb_cloned(skb) && pskb_expand_head(skb, 0, 0, GFP_ATOMIC);
+	int ret = 0;
+
+	if (skb_cloned(skb)) {
+		/* Save and restore truesize: pskb_expand_head() may reallocate
+		 * memory where ksize(kmalloc(S)) != ksize(kmalloc(S)), but we
+		 * cannot change truesize at this point.
+		 */
+		unsigned int save_truesize = skb->truesize;
+
+		ret = pskb_expand_head(skb, 0, 0, GFP_ATOMIC);
+		skb->truesize = save_truesize;
+	}
+	return ret;
 }
 
 /**

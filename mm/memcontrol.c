@@ -1149,6 +1149,68 @@ skip_node:
 	return NULL;
 }
 
+static void mem_cgroup_iter_invalidate(struct mem_cgroup *root)
+{
+	/*
+	 * When a group in the hierarchy below root is destroyed, the
+	 * hierarchy iterator can no longer be trusted since it might
+	 * have pointed to the destroyed group.  Invalidate it.
+	 */
+	atomic_inc(&root->dead_count);
+}
+
+static struct mem_cgroup *
+mem_cgroup_iter_load(struct mem_cgroup_reclaim_iter *iter,
+		     struct mem_cgroup *root,
+		     int *sequence)
+{
+	struct mem_cgroup *position = NULL;
+	/*
+	 * A cgroup destruction happens in two stages: offlining and
+	 * release.  They are separated by a RCU grace period.
+	 *
+	 * If the iterator is valid, we may still race with an
+	 * offlining.  The RCU lock ensures the object won't be
+	 * released, tryget will fail if we lost the race.
+	 */
+	*sequence = atomic_read(&root->dead_count);
+	if (iter->last_dead_count == *sequence) {
+		smp_rmb();
+		position = iter->last_visited;
+
+		/*
+		 * We cannot take a reference to root because we might race
+		 * with root removal and returning NULL would end up in
+		 * an endless loop on the iterator user level when root
+		 * would be returned all the time.
+		 */
+		if (position && position != root &&
+				!css_tryget(&position->css))
+			position = NULL;
+	}
+	return position;
+}
+
+static void mem_cgroup_iter_update(struct mem_cgroup_reclaim_iter *iter,
+				   struct mem_cgroup *last_visited,
+				   struct mem_cgroup *new_position,
+				   struct mem_cgroup *root,
+				   int sequence)
+{
+	/* root reference counting symmetric to mem_cgroup_iter_load */
+	if (last_visited && last_visited != root)
+		css_put(&last_visited->css);
+	/*
+	 * We store the sequence count from the time @last_visited was
+	 * loaded successfully instead of rereading it here so that we
+	 * don't lose destruction events in between.  We could have
+	 * raced with the destruction of @new_position after all.
+	 */
+	iter->last_visited = new_position;
+	smp_wmb();
+	iter->last_dead_count = sequence;
+}
+
 /**
  * mem_cgroup_iter - iterate over memory cgroup hierarchy
  * @root: hierarchy root
@@ -1172,7 +1234,6 @@ struct mem_cgroup *mem_cgroup_iter(struct mem_cgroup *root,
 {
 	struct mem_cgroup *memcg = NULL;
 	struct mem_cgroup *last_visited = NULL;
-	unsigned long uninitialized_var(dead_count);
 
 	if (mem_cgroup_disabled())
 		return NULL;
@@ -1192,6 +1253,7 @@ struct mem_cgroup *mem_cgroup_iter(struct mem_cgroup *root,
 	rcu_read_lock();
 	while (!memcg) {
 		struct mem_cgroup_reclaim_iter *uninitialized_var(iter);
+		int uninitialized_var(seq);
 
 		if (reclaim) {
 			int nid = zone_to_nid(reclaim->zone);
@@ -1205,37 +1267,14 @@ struct mem_cgroup *mem_cgroup_iter(struct mem_cgroup *root,
 				goto out_unlock;
 			}
 
-			/*
-			 * If the dead_count mismatches, a destruction
-			 * has happened or is happening concurrently.
-			 * If the dead_count matches, a destruction
-			 * might still happen concurrently, but since
-			 * we checked under RCU, that destruction
-			 * won't free the object until we release the
-			 * RCU reader lock.  Thus, the dead_count
-			 * check verifies the pointer is still valid,
-			 * css_tryget() verifies the cgroup pointed to
-			 * is alive.
-			 */
-			dead_count = atomic_read(&root->dead_count);
-			if (dead_count == iter->last_dead_count) {
-				smp_rmb();
-				last_visited = iter->last_visited;
-				if (last_visited && last_visited != root &&
-				    !css_tryget(&last_visited->css))
-					last_visited = NULL;
-			}
+			last_visited = mem_cgroup_iter_load(iter, root, &seq);
 		}
 
 		memcg = __mem_cgroup_iter_next(root, last_visited);
 
 		if (reclaim) {
-			if (last_visited && last_visited != root)
-				css_put(&last_visited->css);
-
-			iter->last_visited = memcg;
-			smp_wmb();
-			iter->last_dead_count = dead_count;
+			mem_cgroup_iter_update(iter, last_visited, memcg, root,
+					seq);
 
 			if (!memcg)
 				iter->generation++;
@@ -2803,6 +2842,8 @@ done:
 	return 0;
 nomem:
 	*ptr = NULL;
+	if (gfp_mask & __GFP_NOFAIL)
+		return 0;
 	return -ENOMEM;
 bypass:
 	*ptr = root_mem_cgroup;
@@ -3163,7 +3204,7 @@ int memcg_update_cache_size(struct kmem_cache *s, int num_groups)
 		ssize_t size = memcg_caches_array_size(num_groups);
 
 		size *= sizeof(void *);
-		size += sizeof(struct memcg_cache_params);
+		size += offsetof(struct memcg_cache_params, memcg_caches);
 
 		s->memcg_params = kzalloc(size, GFP_KERNEL);
 		if (!s->memcg_params) {
@@ -3203,16 +3244,19 @@ int memcg_update_cache_size(struct kmem_cache *s, int num_groups)
 	return 0;
 }
 
-int memcg_register_cache(struct mem_cgroup *memcg, struct kmem_cache *s,
-			 struct kmem_cache *root_cache)
+int memcg_alloc_cache_params(struct mem_cgroup *memcg, struct kmem_cache *s,
+			     struct kmem_cache *root_cache)
 {
-	size_t size = sizeof(struct memcg_cache_params);
+	size_t size;
 
 	if (!memcg_kmem_enabled())
 		return 0;
 
-	if (!memcg)
+	if (!memcg) {
+		size = offsetof(struct memcg_cache_params, memcg_caches);
 		size += memcg_limited_groups_array_size * sizeof(void *);
+	} else
+		size = sizeof(struct memcg_cache_params);
 
 	s->memcg_params = kzalloc(size, GFP_KERNEL);
 	if (!s->memcg_params)
@@ -3227,6 +3271,11 @@ int memcg_register_cache(struct mem_cgroup *memcg, struct kmem_cache *s,
 		s->memcg_params->is_root_cache = true;
 
 	return 0;
+}
+
+void memcg_free_cache_params(struct kmem_cache *s)
+{
+	kfree(s->memcg_params);
 }
 
 void memcg_release_cache(struct kmem_cache *s)
@@ -3257,7 +3306,7 @@ void memcg_release_cache(struct kmem_cache *s)
 
 	mem_cgroup_put(memcg);
 out:
-	kfree(s->memcg_params);
+	memcg_free_cache_params(s);
 }
 
 /*
@@ -6346,14 +6395,14 @@ static void mem_cgroup_invalidate_reclaim_iterators(struct mem_cgroup *memcg)
 	struct mem_cgroup *parent = memcg;
 
 	while ((parent = parent_mem_cgroup(parent)))
-		atomic_inc(&parent->dead_count);
+		mem_cgroup_iter_invalidate(parent);
 
 	/*
 	 * if the root memcg is not hierarchical we have to check it
 	 * explicitely.
 	 */
 	if (!root_mem_cgroup->use_hierarchy)
-		atomic_inc(&root_mem_cgroup->dead_count);
+		mem_cgroup_iter_invalidate(root_mem_cgroup);
 }
 
 static void mem_cgroup_css_offline(struct cgroup *cont)
@@ -6377,6 +6426,7 @@ static void mem_cgroup_css_offline(struct cgroup *cont)
 	mem_cgroup_reparent_charges(memcg);
 
 	mem_cgroup_destroy_all_caches(memcg);
+	vmpressure_cleanup(&memcg->vmpressure);
 }
 
 static void mem_cgroup_css_free(struct cgroup *cont)
@@ -6796,12 +6846,6 @@ static int mem_cgroup_can_attach(struct cgroup *cgroup,
 	return ret;
 }
 
-static int mem_cgroup_allow_attach(struct cgroup *cgroup,
-				   struct cgroup_taskset *tset)
-{
-	return subsys_cgroup_allow_attach(cgroup, tset);
-}
-
 static void mem_cgroup_cancel_attach(struct cgroup *cgroup,
 				     struct cgroup_taskset *tset)
 {
@@ -6970,11 +7014,6 @@ static int mem_cgroup_can_attach(struct cgroup *cgroup,
 {
 	return 0;
 }
-static int mem_cgroup_allow_attach(struct cgroup *cgroup,
-				   struct cgroup_taskset *tset)
-{
-	return 0;
-}
 static void mem_cgroup_cancel_attach(struct cgroup *cgroup,
 				     struct cgroup_taskset *tset)
 {
@@ -7010,7 +7049,6 @@ struct cgroup_subsys mem_cgroup_subsys = {
 	.can_attach = mem_cgroup_can_attach,
 	.cancel_attach = mem_cgroup_cancel_attach,
 	.attach = mem_cgroup_move_task,
-	.allow_attach = mem_cgroup_allow_attach,
 	.bind = mem_cgroup_bind,
 	.base_cftypes = mem_cgroup_files,
 	.early_init = 0,
@@ -7020,7 +7058,6 @@ struct cgroup_subsys mem_cgroup_subsys = {
 #ifdef CONFIG_MEMCG_SWAP
 static int __init enable_swap_account(char *s)
 {
-	/* consider enabled if no parameter or 1 is given */
 	if (!strcmp(s, "1"))
 		really_do_swap_account = 1;
 	else if (!strcmp(s, "0"))

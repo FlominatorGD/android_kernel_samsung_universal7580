@@ -54,15 +54,14 @@ extern void tcp_time_wait(struct sock *sk, int state, int timeo);
 
 #define MAX_TCP_HEADER	(128 + MAX_HEADER)
 #define MAX_TCP_OPTION_SPACE 40
+#define TCP_MIN_SND_MSS		48
+#define TCP_MIN_GSO_SIZE	(TCP_MIN_SND_MSS - MAX_TCP_OPTION_SPACE)
 
 /* 
  * Never offer a window over 32767 without using window scaling. Some
  * poor stacks do signed 16bit maths! 
  */
 #define MAX_TCP_WINDOW		32767U
-
-/* Offer an initial receive window of 10 mss. */
-#define TCP_DEFAULT_INIT_RCVWND	10
 
 /* Minimal accepted MSS. It is (60+60+8) - (20+20). */
 #define TCP_MIN_MSS		88U
@@ -281,7 +280,6 @@ extern int sysctl_tcp_mtu_probing;
 extern int sysctl_tcp_base_mss;
 extern int sysctl_tcp_workaround_signed_windows;
 extern int sysctl_tcp_slow_start_after_idle;
-extern int sysctl_tcp_max_ssthresh;
 extern int sysctl_tcp_thin_linear_timeouts;
 extern int sysctl_tcp_thin_dupack;
 extern int sysctl_tcp_early_retrans;
@@ -378,8 +376,8 @@ extern void tcp_delack_timer_handler(struct sock *sk);
 extern int tcp_ioctl(struct sock *sk, int cmd, unsigned long arg);
 extern int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
 				 const struct tcphdr *th, unsigned int len);
-extern int tcp_rcv_established(struct sock *sk, struct sk_buff *skb,
-			       const struct tcphdr *th, unsigned int len);
+extern void tcp_rcv_established(struct sock *sk, struct sk_buff *skb,
+				const struct tcphdr *th, unsigned int len);
 extern void tcp_rcv_space_adjust(struct sock *sk);
 extern void tcp_cleanup_rbuf(struct sock *sk, int copied);
 extern int tcp_twsk_unique(struct sock *sk, struct sock *sktw, void *twp);
@@ -527,7 +525,7 @@ extern void tcp_retransmit_timer(struct sock *sk);
 extern void tcp_xmit_retransmit_queue(struct sock *);
 extern void tcp_simple_retransmit(struct sock *);
 extern int tcp_trim_head(struct sock *, struct sk_buff *, u32);
-extern int tcp_fragment(struct sock *, struct sk_buff *, u32, unsigned int);
+extern int tcp_fragment(struct sock *, struct sk_buff *, u32, unsigned int, gfp_t);
 
 extern void tcp_send_probe0(struct sock *);
 extern void tcp_send_partial(struct sock *);
@@ -584,7 +582,7 @@ static inline int tcp_bound_to_half_wnd(struct tcp_sock *tp, int pktsize)
 }
 
 /* tcp.c */
-void tcp_get_info(struct sock *, struct tcp_info *);
+extern void tcp_get_info(struct sock *, struct tcp_info *);
 
 /* Read 'sendfile()'-style from a TCP socket */
 typedef int (*sk_read_actor_t)(read_descriptor_t *, struct sk_buff *,
@@ -597,7 +595,6 @@ extern void tcp_initialize_rcv_mss(struct sock *sk);
 extern int tcp_mtu_to_mss(struct sock *sk, int pmtu);
 extern int tcp_mss_to_mtu(struct sock *sk, int mss);
 extern void tcp_mtup_init(struct sock *sk);
-extern void tcp_valid_rtt_meas(struct sock *sk, u32 seq_rtt);
 extern void tcp_init_buffer_space(struct sock *sk);
 
 static inline void tcp_bound_rto(const struct sock *sk)
@@ -785,7 +782,7 @@ struct tcp_congestion_ops {
 	/* lower bound for congestion window (optional) */
 	u32 (*min_cwnd)(const struct sock *sk);
 	/* do new cwnd calculation (required) */
-	void (*cong_avoid)(struct sock *sk, u32 ack, u32 in_flight);
+	void (*cong_avoid)(struct sock *sk, u32 ack, u32 acked, u32 in_flight);
 	/* call before changing ca_state (optional) */
 	void (*set_state)(struct sock *sk, u8 new_state);
 	/* call when cwnd event occurs (optional) */
@@ -812,12 +809,12 @@ extern void tcp_get_available_congestion_control(char *buf, size_t len);
 extern void tcp_get_allowed_congestion_control(char *buf, size_t len);
 extern int tcp_set_allowed_congestion_control(char *allowed);
 extern int tcp_set_congestion_control(struct sock *sk, const char *name);
-extern void tcp_slow_start(struct tcp_sock *tp);
+extern int tcp_slow_start(struct tcp_sock *tp, u32 acked);
 extern void tcp_cong_avoid_ai(struct tcp_sock *tp, u32 w);
 
 extern struct tcp_congestion_ops tcp_init_congestion_ops;
 extern u32 tcp_reno_ssthresh(struct sock *sk);
-extern void tcp_reno_cong_avoid(struct sock *sk, u32 ack, u32 in_flight);
+extern void tcp_reno_cong_avoid(struct sock *sk, u32 ack, u32 acked, u32 in_flight);
 extern u32 tcp_reno_min_cwnd(const struct sock *sk);
 extern struct tcp_congestion_ops tcp_reno;
 
@@ -1053,6 +1050,8 @@ static inline void tcp_sack_reset(struct tcp_options_received *rx_opt)
 	rx_opt->num_sacks = 0;
 }
 
+extern u32 tcp_default_init_rwnd(u32 mss);
+
 /* Determine a window scaling and initial window to offer. */
 extern void tcp_select_initial_window(int __space, __u32 mss,
 				      __u32 *rcv_wnd, __u32 *window_clamp,
@@ -1099,15 +1098,6 @@ static inline void tcp_openreq_init(struct request_sock *req,
 	ireq->ecn_ok = 0;
 	ireq->rmt_port = tcp_hdr(skb)->source;
 	ireq->loc_port = tcp_hdr(skb)->dest;
-}
-
-/* Compute time elapsed between SYNACK and the ACK completing 3WHS */
-static inline void tcp_synack_rtt_meas(struct sock *sk,
-				       struct request_sock *req)
-{
-	if (tcp_rsk(req)->snt_synack)
-		tcp_valid_rtt_meas(sk,
-		    tcp_time_stamp - tcp_rsk(req)->snt_synack);
 }
 
 extern void tcp_enter_memory_pressure(struct sock *sk);
@@ -1199,7 +1189,6 @@ static inline void tcp_mib_init(struct net *net)
 static inline void tcp_clear_retrans_hints_partial(struct tcp_sock *tp)
 {
 	tp->lost_skb_hint = NULL;
-	tp->scoreboard_skb_hint = NULL;
 }
 
 static inline void tcp_clear_all_retrans_hints(struct tcp_sock *tp)
@@ -1403,6 +1392,27 @@ static inline void tcp_check_send_head(struct sock *sk, struct sk_buff *skb_unli
 static inline void tcp_init_send_head(struct sock *sk)
 {
 	sk->sk_send_head = NULL;
+}
+
+static inline struct sk_buff *tcp_rtx_queue_head(const struct sock *sk)
+{
+	struct sk_buff *skb = tcp_write_queue_head(sk);
+
+	if (skb == tcp_send_head(sk))
+		skb = NULL;
+
+	return skb;
+}
+
+static inline struct sk_buff *tcp_rtx_queue_tail(const struct sock *sk)
+{
+	struct sk_buff *skb = tcp_send_head(sk);
+
+	/* empty retransmit queue, for example due to zero window */
+	if (skb == tcp_write_queue_head(sk))
+		return NULL;
+
+	return skb ? tcp_write_queue_prev(sk, skb) : tcp_write_queue_tail(sk);
 }
 
 static inline void __tcp_add_write_queue_tail(struct sock *sk, struct sk_buff *skb)

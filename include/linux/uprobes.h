@@ -26,6 +26,7 @@
 
 #include <linux/errno.h>
 #include <linux/rbtree.h>
+#include <linux/types.h>
 
 struct vm_area_struct;
 struct mm_struct;
@@ -71,14 +72,24 @@ enum uprobe_task_state {
  */
 struct uprobe_task {
 	enum uprobe_task_state		state;
-	struct arch_uprobe_task		autask;
+
+	union {
+		struct {
+			struct arch_uprobe_task	autask;
+			unsigned long		vaddr;
+		};
+
+		struct {
+			struct callback_head	dup_xol_work;
+			unsigned long		dup_xol_addr;
+		};
+	};
+
+	struct uprobe			*active_uprobe;
+	unsigned long			xol_vaddr;
 
 	struct return_instance		*return_instances;
 	unsigned int			depth;
-	struct uprobe			*active_uprobe;
-
-	unsigned long			xol_vaddr;
-	unsigned long			vaddr;
 };
 
 /*
@@ -117,13 +128,13 @@ extern void uprobe_start_dup_mmap(void);
 extern void uprobe_end_dup_mmap(void);
 extern void uprobe_dup_mmap(struct mm_struct *oldmm, struct mm_struct *newmm);
 extern void uprobe_free_utask(struct task_struct *t);
-extern void uprobe_copy_process(struct task_struct *t);
+extern void uprobe_copy_process(struct task_struct *t, unsigned long flags);
 extern unsigned long __weak uprobe_get_swbp_addr(struct pt_regs *regs);
 extern int uprobe_post_sstep_notifier(struct pt_regs *regs);
 extern int uprobe_pre_sstep_notifier(struct pt_regs *regs);
 extern void uprobe_notify_resume(struct pt_regs *regs);
 extern bool uprobe_deny_signal(void);
-extern bool __weak arch_uprobe_skip_sstep(struct arch_uprobe *aup, struct pt_regs *regs);
+extern bool arch_uprobe_skip_sstep(struct arch_uprobe *aup, struct pt_regs *regs);
 extern void uprobe_clear_state(struct mm_struct *mm);
 #else /* !CONFIG_UPROBES */
 struct uprobes_state {
@@ -174,7 +185,7 @@ static inline unsigned long uprobe_get_swbp_addr(struct pt_regs *regs)
 static inline void uprobe_free_utask(struct task_struct *t)
 {
 }
-static inline void uprobe_copy_process(struct task_struct *t)
+static inline void uprobe_copy_process(struct task_struct *t, unsigned long flags)
 {
 }
 static inline void uprobe_clear_state(struct mm_struct *mm)

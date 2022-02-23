@@ -123,7 +123,6 @@ enum usb_interface_condition {
  * @dev: driver model's view of this device
  * @usb_dev: if an interface is bound to the USB major, this will point
  *	to the sysfs representation for that device.
- * @pm_usage_cnt: PM usage counter for this interface
  * @reset_ws: Used for scheduling resets from atomic context.
  * @reset_running: set to 1 if the interface is currently running a
  *      queued reset so that usb_cancel_queued_reset() doesn't try to
@@ -184,7 +183,6 @@ struct usb_interface {
 
 	struct device dev;		/* interface specific device info */
 	struct device *usb_dev;
-	atomic_t pm_usage_cnt;		/* usage counter for autosuspend */
 	struct work_struct reset_ws;	/* for resets in atomic context */
 };
 #define	to_usb_interface(d) container_of(d, struct usb_interface, dev)
@@ -202,6 +200,8 @@ static inline void usb_set_intfdata(struct usb_interface *intf, void *data)
 struct usb_interface *usb_get_intf(struct usb_interface *intf);
 void usb_put_intf(struct usb_interface *intf);
 
+/* Hard limit */
+#define USB_MAXENDPOINTS	30
 /* this maximum is arbitrary */
 #define USB_MAXINTERFACES	32
 #define USB_MAXIADS		(USB_MAXINTERFACES/2)
@@ -330,11 +330,11 @@ struct usb_host_bos {
 };
 
 int __usb_get_extra_descriptor(char *buffer, unsigned size,
-	unsigned char type, void **ptr);
+	unsigned char type, void **ptr, size_t min);
 #define usb_get_extra_descriptor(ifpoint, type, ptr) \
 				__usb_get_extra_descriptor((ifpoint)->extra, \
 				(ifpoint)->extralen, \
-				type, (void **)ptr)
+				type, (void **)ptr, sizeof(**(ptr)))
 
 /* ----------------------------------------------------------------------- */
 
@@ -725,7 +725,10 @@ extern int usb_driver_claim_interface(struct usb_driver *driver,
  * usb_interface_claimed - returns true iff an interface is claimed
  * @iface: the interface being checked
  *
- * Returns true (nonzero) iff the interface is claimed, else false (zero).
+ * Return: %true (nonzero) iff the interface is claimed, else %false
+ * (zero).
+ *
+ * Note:
  * Callers must own the driver model's usb bus readlock.  So driver
  * probe() entries don't need extra locking, but other call contexts
  * may need to explicitly claim that lock.
@@ -761,8 +764,9 @@ extern struct usb_host_interface *usb_find_alt_setting(
  * @buf: where to put the string
  * @size: how big is "buf"?
  *
- * Returns length of the string (> 0) or negative if size was too small.
+ * Return: Length of the string (> 0) or negative if size was too small.
  *
+ * Note:
  * This identifier is intended to be "stable", reflecting physical paths in
  * hardware such as physical bus addresses for host controllers or ports on
  * USB hubs.  That makes it stay the same until systems are physically
@@ -969,6 +973,7 @@ struct usb_dynid {
 };
 
 extern ssize_t usb_store_new_id(struct usb_dynids *dynids,
+				const struct usb_device_id *id_table,
 				struct device_driver *driver,
 				const char *buf, size_t count);
 
@@ -1586,7 +1591,7 @@ extern int usb_anchor_empty(struct usb_anchor *anchor);
  * usb_urb_dir_in - check if an URB describes an IN transfer
  * @urb: URB to be checked
  *
- * Returns 1 if @urb describes an IN transfer (device-to-host),
+ * Return: 1 if @urb describes an IN transfer (device-to-host),
  * otherwise 0.
  */
 static inline int usb_urb_dir_in(struct urb *urb)
@@ -1598,7 +1603,7 @@ static inline int usb_urb_dir_in(struct urb *urb)
  * usb_urb_dir_out - check if an URB describes an OUT transfer
  * @urb: URB to be checked
  *
- * Returns 1 if @urb describes an OUT transfer (host-to-device),
+ * Return: 1 if @urb describes an OUT transfer (host-to-device),
  * otherwise 0.
  */
 static inline int usb_urb_dir_out(struct urb *urb)

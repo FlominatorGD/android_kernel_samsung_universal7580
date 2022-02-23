@@ -27,7 +27,8 @@
 /**
  * do_invalidatepage - invalidate part or all of a page
  * @page: the page which is affected
- * @offset: the index of the truncation point
+ * @offset: start of the range to invalidate
+ * @length: length of the range to invalidate
  *
  * do_invalidatepage() is called when all or part of the page has become
  * invalidated by a truncate operation.
@@ -38,16 +39,18 @@
  * point.  Because the caller is about to free (and possibly reuse) those
  * blocks on-disk.
  */
-void do_invalidatepage(struct page *page, unsigned long offset)
+void do_invalidatepage(struct page *page, unsigned int offset,
+		       unsigned int length)
 {
-	void (*invalidatepage)(struct page *, unsigned long);
+	void (*invalidatepage)(struct page *, unsigned int, unsigned int);
+
 	invalidatepage = page->mapping->a_ops->invalidatepage;
 #ifdef CONFIG_BLOCK
 	if (!invalidatepage)
 		invalidatepage = block_invalidatepage;
 #endif
 	if (invalidatepage)
-		(*invalidatepage)(page, offset);
+		(*invalidatepage)(page, offset, length);
 }
 
 static inline void truncate_partial_page(struct page *page, unsigned partial)
@@ -55,7 +58,7 @@ static inline void truncate_partial_page(struct page *page, unsigned partial)
 	zero_user_segment(page, partial, PAGE_CACHE_SIZE);
 	cleancache_invalidate_page(page->mapping, page);
 	if (page_has_private(page))
-		do_invalidatepage(page, partial);
+		do_invalidatepage(page, partial, PAGE_CACHE_SIZE - partial);
 }
 
 /*
@@ -104,7 +107,7 @@ truncate_complete_page(struct address_space *mapping, struct page *page)
 		return -EIO;
 
 	if (page_has_private(page))
-		do_invalidatepage(page, 0);
+		do_invalidatepage(page, 0, PAGE_CACHE_SIZE);
 
 	cancel_dirty_page(page, PAGE_CACHE_SIZE);
 
@@ -354,9 +357,13 @@ void truncate_inode_pages_final(struct address_space *mapping)
 		 */
 		spin_lock_irq(&mapping->tree_lock);
 		spin_unlock_irq(&mapping->tree_lock);
-
-		truncate_inode_pages(mapping, 0);
 	}
+
+	/*
+	 * Cleancache needs notification even if there are no pages or shadow
+	 * entries.
+	 */
+	truncate_inode_pages(mapping, 0);
 }
 EXPORT_SYMBOL(truncate_inode_pages_final);
 
@@ -568,7 +575,6 @@ EXPORT_SYMBOL_GPL(invalidate_inode_pages2);
 /**
  * truncate_pagecache - unmap and remove pagecache that has been truncated
  * @inode: inode
- * @oldsize: old file size
  * @newsize: new file size
  *
  * inode's new i_size must already be written before truncate_pagecache
@@ -581,7 +587,7 @@ EXPORT_SYMBOL_GPL(invalidate_inode_pages2);
  * situations such as writepage being called for a page that has already
  * had its underlying blocks deallocated.
  */
-void truncate_pagecache(struct inode *inode, loff_t oldsize, loff_t newsize)
+void truncate_pagecache(struct inode *inode, loff_t newsize)
 {
 	struct address_space *mapping = inode->i_mapping;
 	loff_t holebegin = round_up(newsize, PAGE_SIZE);
@@ -620,7 +626,7 @@ void truncate_setsize(struct inode *inode, loff_t newsize)
 	i_size_write(inode, newsize);
 	if (newsize > oldsize)
 		pagecache_isize_extended(inode, oldsize, newsize);
-	truncate_pagecache(inode, oldsize, newsize);
+	truncate_pagecache(inode, newsize);
 }
 EXPORT_SYMBOL(truncate_setsize);
 

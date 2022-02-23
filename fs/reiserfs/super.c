@@ -1327,6 +1327,7 @@ static int reiserfs_remount(struct super_block *s, int *mount_flags, char *arg)
 	int i;
 #endif
 
+	sync_filesystem(s);
 	reiserfs_write_lock(s);
 
 #ifdef CONFIG_QUOTA
@@ -1938,6 +1939,14 @@ static int reiserfs_fill_super(struct super_block *s, void *data, int silent)
 	if (root_inode->i_state & I_NEW) {
 		reiserfs_read_locked_inode(root_inode, &args);
 		unlock_new_inode(root_inode);
+	}
+
+	if (!S_ISDIR(root_inode->i_mode) || !inode_get_bytes(root_inode) ||
+	    !root_inode->i_size) {
+		SWARN(silent, s, "", "corrupt root inode, run fsck");
+		iput(root_inode);
+		errval = -EUCLEAN;
+		goto error;
 	}
 
 	s->s_root = d_make_root(root_inode);

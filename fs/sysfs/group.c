@@ -4,7 +4,7 @@
  * Copyright (c) 2003 Patrick Mochel
  * Copyright (c) 2003 Open Source Development Lab
  *
- * This file is released undert the GPL v2. 
+ * This file is released undert the GPL v2.
  *
  */
 
@@ -103,6 +103,41 @@ int sysfs_create_group(struct kobject *kobj,
 {
 	return internal_create_group(kobj, 0, grp);
 }
+EXPORT_SYMBOL_GPL(sysfs_create_group);
+
+/**
+ * sysfs_create_groups - given a directory kobject, create a bunch of attribute groups
+ * @kobj:	The kobject to create the group on
+ * @groups:	The attribute groups to create, NULL terminated
+ *
+ * This function creates a bunch of attribute groups.  If an error occurs when
+ * creating a group, all previously created groups will be removed, unwinding
+ * everything back to the original state when this function was called.
+ * It will explicitly warn and error if any of the attribute files being
+ * created already exist.
+ *
+ * Returns 0 on success or error code from sysfs_create_group on error.
+ */
+int sysfs_create_groups(struct kobject *kobj,
+			const struct attribute_group **groups)
+{
+	int error = 0;
+	int i;
+
+	if (!groups)
+		return 0;
+
+	for (i = 0; groups[i]; i++) {
+		error = sysfs_create_group(kobj, groups[i]);
+		if (error) {
+			while (--i >= 0)
+				sysfs_remove_group(kobj, groups[i]);
+			break;
+		}
+	}
+	return error;
+}
+EXPORT_SYMBOL_GPL(sysfs_create_groups);
 
 /**
  * sysfs_update_group - given a directory kobject, update an attribute group
@@ -126,10 +161,9 @@ int sysfs_update_group(struct kobject *kobj,
 {
 	return internal_create_group(kobj, 1, grp);
 }
+EXPORT_SYMBOL_GPL(sysfs_update_group);
 
-
-
-void sysfs_remove_group(struct kobject * kobj, 
+void sysfs_remove_group(struct kobject * kobj,
 			const struct attribute_group * grp)
 {
 	struct sysfs_dirent *dir_sd = kobj->sd;
@@ -138,8 +172,9 @@ void sysfs_remove_group(struct kobject * kobj,
 	if (grp->name) {
 		sd = sysfs_get_dirent(dir_sd, NULL, grp->name);
 		if (!sd) {
-			WARN(!sd, KERN_WARNING "sysfs group %p not found for "
-				"kobject '%s'\n", grp, kobject_name(kobj));
+			WARN(!sd, KERN_WARNING
+			     "sysfs group %p not found for kobject '%s'\n",
+			     grp, kobject_name(kobj));
 			return;
 		}
 	} else
@@ -151,6 +186,27 @@ void sysfs_remove_group(struct kobject * kobj,
 
 	sysfs_put(sd);
 }
+EXPORT_SYMBOL_GPL(sysfs_remove_group);
+
+/**
+ * sysfs_remove_groups - remove a list of groups
+ *
+ * kobj:	The kobject for the groups to be removed from
+ * groups:	NULL terminated list of groups to be removed
+ *
+ * If groups is not NULL, remove the specified groups from the kobject.
+ */
+void sysfs_remove_groups(struct kobject *kobj,
+			 const struct attribute_group **groups)
+{
+	int i;
+
+	if (!groups)
+		return;
+	for (i = 0; groups[i]; i++)
+		sysfs_remove_group(kobj, groups[i]);
+}
+EXPORT_SYMBOL_GPL(sysfs_remove_groups);
 
 /**
  * sysfs_merge_group - merge files into a pre-existing attribute group.
@@ -247,7 +303,3 @@ void sysfs_remove_link_from_group(struct kobject *kobj, const char *group_name,
 	}
 }
 EXPORT_SYMBOL_GPL(sysfs_remove_link_from_group);
-
-EXPORT_SYMBOL_GPL(sysfs_create_group);
-EXPORT_SYMBOL_GPL(sysfs_update_group);
-EXPORT_SYMBOL_GPL(sysfs_remove_group);

@@ -134,22 +134,25 @@ int __init register_security(struct security_operations *ops)
 
 /* Security operations */
 
-int security_binder_set_context_mgr(struct task_struct *mgr)
+int security_binder_set_context_mgr(const struct cred *mgr)
 {
 	return security_ops->binder_set_context_mgr(mgr);
 }
 
-int security_binder_transaction(struct task_struct *from, struct task_struct *to)
+int security_binder_transaction(const struct cred *from,
+				const struct cred *to)
 {
 	return security_ops->binder_transaction(from, to);
 }
 
-int security_binder_transfer_binder(struct task_struct *from, struct task_struct *to)
+int security_binder_transfer_binder(const struct cred *from,
+				    const struct cred *to)
 {
 	return security_ops->binder_transfer_binder(from, to);
 }
 
-int security_binder_transfer_file(struct task_struct *from, struct task_struct *to, struct file *file)
+int security_binder_transfer_file(const struct cred *from,
+				  const struct cred *to, struct file *file)
 {
 	return security_ops->binder_transfer_file(from, to, file);
 }
@@ -812,6 +815,13 @@ int security_cred_alloc_blank(struct cred *cred, gfp_t gfp)
 
 void security_cred_free(struct cred *cred)
 {
+	/*
+	 * There is a failure case in prepare_creds() that
+	 * may result in a call here with ->security being NULL.
+	 */
+	if (unlikely(cred->security == NULL))
+		return;
+
 	security_ops->cred_free(cred);
 }
 
@@ -1309,11 +1319,6 @@ int security_tun_dev_open(void *security)
 	return security_ops->tun_dev_open(security);
 }
 EXPORT_SYMBOL(security_tun_dev_open);
-
-void security_skb_owned_by(struct sk_buff *skb, struct sock *sk)
-{
-	security_ops->skb_owned_by(skb, sk);
-}
 
 #endif	/* CONFIG_SECURITY_NETWORK */
 

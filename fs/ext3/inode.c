@@ -1825,7 +1825,8 @@ ext3_readpages(struct file *file, struct address_space *mapping,
 	return mpage_readpages(mapping, pages, nr_pages, ext3_get_block);
 }
 
-static void ext3_invalidatepage(struct page *page, unsigned long offset)
+static void ext3_invalidatepage(struct page *page, unsigned int offset,
+				unsigned int length)
 {
 	journal_t *journal = EXT3_JOURNAL(page->mapping->host);
 
@@ -3251,7 +3252,12 @@ int ext3_write_inode(struct inode *inode, struct writeback_control *wbc)
 		return -EIO;
 	}
 
-	if (wbc->sync_mode != WB_SYNC_ALL)
+	/*
+	 * No need to force transaction in WB_SYNC_NONE mode. Also
+	 * ext3_sync_fs() will force the commit after everything is
+	 * written.
+	 */
+	if (wbc->sync_mode != WB_SYNC_ALL || wbc->for_sync)
 		return 0;
 
 	return ext3_force_commit(inode->i_sb);

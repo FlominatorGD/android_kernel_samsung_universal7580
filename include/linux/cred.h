@@ -137,17 +137,12 @@ struct cred {
 	struct user_struct *user;	/* real user ID subscription */
 	struct user_namespace *user_ns; /* user_ns the caps and keyrings are relative to. */
 	struct group_info *group_info;	/* supplementary groups for euid/fsgid */
-	struct rcu_head	rcu;		/* RCU deletion hook */
-#ifdef CONFIG_RKP_KDP
-	atomic_t *use_cnt;
-	struct task_struct *bp_task;
-	void *bp_pgd;
-	unsigned long long type;
-#endif /*CONFIG_RKP_KDP*/
+	/* RCU deletion */
+	union {
+		int non_rcu;			/* Can we skip RCU deletion? */
+		struct rcu_head	rcu;		/* RCU deletion hook */
+	};
 };
-#ifdef CONFIG_RKP_KDP
-#define override_creds(x) rkp_override_creds(&x)
-#endif /*CONFIG_RKP_KDP*/
 
 extern void __put_cred(struct cred *);
 extern void exit_creds(struct task_struct *);
@@ -158,11 +153,7 @@ extern struct cred *prepare_creds(void);
 extern struct cred *prepare_exec_creds(void);
 extern int commit_creds(struct cred *);
 extern void abort_creds(struct cred *);
-#ifndef CONFIG_RKP_KDP
 extern const struct cred *override_creds(const struct cred *);
-#else
-extern const struct cred *rkp_override_creds(struct cred **);
-#endif /*CONFIG_RKP_KDP*/
 extern void revert_creds(const struct cred *);
 extern struct cred *prepare_kernel_cred(struct task_struct *);
 extern int change_create_files_as(struct cred *, struct inode *);
@@ -225,21 +216,18 @@ static inline bool cap_ambient_invariant_ok(const struct cred *cred)
  * Get a reference on the specified set of new credentials.  The caller must
  * release the reference.
  */
-#ifdef CONFIG_RKP_KDP
-struct cred *get_new_cred(struct cred *cred);
-#else
 static inline struct cred *get_new_cred(struct cred *cred)
 {
 	atomic_inc(&cred->usage);
 	return cred;
 }
-#endif /*CONFIG_RKP_KDP*/
+
 /**
  * get_cred - Get a reference on a set of credentials
  * @cred: The credentials to reference
  *
  * Get a reference on the specified set of credentials.  The caller must
- * release the reference.
+ * release the reference.  If %NULL is passed, it is returned with no action.
  *
  * This is used to deal with a committed set of credentials.  Although the
  * pointer is const, this will temporarily discard the const and increment the
@@ -250,7 +238,10 @@ static inline struct cred *get_new_cred(struct cred *cred)
 static inline const struct cred *get_cred(const struct cred *cred)
 {
 	struct cred *nonconst_cred = (struct cred *) cred;
+	if (!cred)
+		return cred;
 	validate_creds(cred);
+	nonconst_cred->non_rcu = 0;
 	return get_new_cred(nonconst_cred);
 }
 
@@ -259,24 +250,22 @@ static inline const struct cred *get_cred(const struct cred *cred)
  * @cred: The credentials to release
  *
  * Release a reference to a set of credentials, deleting them when the last ref
- * is released.
+ * is released.  If %NULL is passed, nothing is done.
  *
  * This takes a const pointer to a set of credentials because the credentials
  * on task_struct are attached by const pointers to prevent accidental
  * alteration of otherwise immutable credential sets.
  */
-#ifdef CONFIG_RKP_KDP
-void put_cred(const struct cred *_cred);
-#else
 static inline void put_cred(const struct cred *_cred)
 {
 	struct cred *cred = (struct cred *) _cred;
 
-	validate_creds(cred);
-	if (atomic_dec_and_test(&(cred)->usage))
-		__put_cred(cred);
+	if (cred) {
+		validate_creds(cred);
+		if (atomic_dec_and_test(&(cred)->usage))
+			__put_cred(cred);
+	}
 }
-#endif /*CONFIG_RKP_KDP*/
 
 /**
  * current_cred - Access the current task's subjective credentials

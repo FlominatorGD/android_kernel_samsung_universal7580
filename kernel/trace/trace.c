@@ -25,6 +25,7 @@
 #include <linux/linkage.h>
 #include <linux/uaccess.h>
 #include <linux/kprobes.h>
+#include <linux/vmalloc.h>
 #include <linux/ftrace.h>
 #include <linux/module.h>
 #include <linux/percpu.h>
@@ -1247,9 +1248,6 @@ static unsigned saved_tgids[SAVED_CMDLINES];
 static int cmdline_idx;
 static arch_spinlock_t trace_cmdline_lock = __ARCH_SPIN_LOCK_UNLOCKED;
 
-/* temporary disable recording */
-static atomic_t trace_record_cmdline_disabled __read_mostly;
-
 static void trace_init_cmdlines(void)
 {
 	memset(&map_pid_to_cmdline, NO_CMDLINE_MAP, sizeof(map_pid_to_cmdline));
@@ -1412,7 +1410,11 @@ static int trace_save_cmdline(struct task_struct *tsk)
 {
 	unsigned pid, idx;
 
-	if (!tsk->pid || unlikely(tsk->pid > PID_MAX_DEFAULT))
+	/* treat recording of idle task as a success */
+	if (!tsk->pid)
+		return 1;
+
+	if (unlikely(tsk->pid > PID_MAX_DEFAULT))
 		return 0;
 
 	/*
@@ -1475,7 +1477,7 @@ void trace_find_cmdline(int pid, char comm[])
 	arch_spin_lock(&trace_cmdline_lock);
 	map = map_pid_to_cmdline[pid];
 	if (map != NO_CMDLINE_MAP)
-		strcpy(comm, saved_cmdlines[map]);
+		strlcpy(comm, saved_cmdlines[map], TASK_COMM_LEN);
 	else
 		strcpy(comm, "<...>");
 
@@ -1504,9 +1506,6 @@ int trace_find_tgid(int pid)
 
 void tracing_record_cmdline(struct task_struct *tsk)
 {
-	if (atomic_read(&trace_record_cmdline_disabled) || !tracing_is_on())
-		return;
-
 	if (!__this_cpu_read(trace_cmdline_save))
 		return;
 
@@ -1723,7 +1722,8 @@ static void __ftrace_trace_stack(struct ring_buffer *buffer,
 	size *= sizeof(unsigned long);
 
 	event = trace_buffer_lock_reserve(buffer, TRACE_STACK,
-					  sizeof(*entry) + size, flags, pc);
+				    (sizeof(*entry) - sizeof(entry->caller)) + size,
+				    flags, pc);
 	if (!event)
 		goto out;
 	entry = ring_buffer_event_data(event);
@@ -1955,7 +1955,21 @@ void trace_printk_init_buffers(void)
 	if (alloc_percpu_trace_buffer())
 		return;
 
-	pr_info("ftrace: Allocated trace_printk buffers\n");
+	/* trace_printk() is for debug use only. Don't use it in production. */
+
+	pr_warning("\n**********************************************************\n");
+	pr_warning("**   NOTICE NOTICE NOTICE NOTICE NOTICE NOTICE NOTICE   **\n");
+	pr_warning("**                                                      **\n");
+	pr_warning("** trace_printk() being used. Allocating extra memory.  **\n");
+	pr_warning("**                                                      **\n");
+	pr_warning("** This means that this is a DEBUG kernel and it is     **\n");
+	pr_warning("** unsafe for production use.                           **\n");
+	pr_warning("**                                                      **\n");
+	pr_warning("** If you see this message and you are not debugging    **\n");
+	pr_warning("** the kernel, report this immediately to your vendor!  **\n");
+	pr_warning("**                                                      **\n");
+	pr_warning("**   NOTICE NOTICE NOTICE NOTICE NOTICE NOTICE NOTICE   **\n");
+	pr_warning("**********************************************************\n");
 
 	/* Expand the buffers to set size */
 	tracing_update_buffers();
@@ -2347,9 +2361,6 @@ static void *s_start(struct seq_file *m, loff_t *pos)
 		return ERR_PTR(-EBUSY);
 #endif
 
-	if (!iter->snapshot)
-		atomic_inc(&trace_record_cmdline_disabled);
-
 	if (*pos != iter->pos) {
 		iter->ent = NULL;
 		iter->cpu = 0;
@@ -2391,9 +2402,6 @@ static void s_stop(struct seq_file *m, void *p)
 	if (iter->snapshot && iter->trace->use_max_tr)
 		return;
 #endif
-
-	if (!iter->snapshot)
-		atomic_dec(&trace_record_cmdline_disabled);
 
 	trace_access_unlock(iter->cpu_file);
 	trace_event_read_unlock();
@@ -4093,7 +4101,6 @@ out:
 	return ret;
 
 fail:
-	kfree(iter->trace);
 	kfree(iter);
 	__trace_array_put(tr);
 	mutex_unlock(&trace_types_lock);
@@ -5200,12 +5207,16 @@ static void buffer_pipe_buf_release(struct pipe_inode_info *pipe,
 	buf->private = 0;
 }
 
-static void buffer_pipe_buf_get(struct pipe_inode_info *pipe,
+static bool buffer_pipe_buf_get(struct pipe_inode_info *pipe,
 				struct pipe_buffer *buf)
 {
 	struct buffer_ref *ref = (struct buffer_ref *)buf->private;
 
+	if (ref->ref > INT_MAX/2)
+		return false;
+
 	ref->ref++;
+	return true;
 }
 
 /* Pipe buffer operations for a buffer. */
@@ -6051,6 +6062,19 @@ static int allocate_trace_buffers(struct trace_array *tr, int size)
 	 */
 	allocate_snapshot = false;
 #endif
+
+	/*
+	 * Because of some magic with the way alloc_percpu() works on
+	 * x86_64, we need to synchronize the pgd of all the tables,
+	 * otherwise the trace events that happen in x86_64 page fault
+	 * handlers can't cope with accessing the chance that a
+	 * alloc_percpu()'d memory might be touched in the page fault trace
+	 * event. Oh, and we need to audit all other alloc_percpu() and vmalloc()
+	 * calls in tracing, because something might get triggered within a
+	 * page fault trace event!
+	 */
+	vmalloc_sync_mappings();
+
 	return 0;
 }
 

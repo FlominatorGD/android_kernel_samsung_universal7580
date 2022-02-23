@@ -399,8 +399,8 @@ void sctp_generate_heartbeat_event(unsigned long data)
 			   asoc->state, asoc->ep, asoc,
 			   transport, GFP_ATOMIC);
 
-	 if (error)
-		 sk->sk_err = -error;
+	if (error)
+		sk->sk_err = -error;
 
 out_unlock:
 	sctp_bh_unlock_sock(sk);
@@ -416,7 +416,7 @@ void sctp_generate_proto_unreach_event(unsigned long data)
 	struct sctp_association *asoc = transport->asoc;
 	struct sock *sk = asoc->base.sk;
 	struct net *net = sock_net(sk);
-	
+
 	sctp_bh_lock_sock(sk);
 	if (sock_owned_by_user(sk)) {
 		SCTP_DEBUG_PRINTK("%s:Sock is busy.\n", __func__);
@@ -557,7 +557,7 @@ static void sctp_cmd_init_failed(sctp_cmd_seq_t *commands,
 {
 	struct sctp_ulpevent *event;
 
-	event = sctp_ulpevent_make_assoc_change(asoc,0, SCTP_CANT_STR_ASSOC,
+	event = sctp_ulpevent_make_assoc_change(asoc, 0, SCTP_CANT_STR_ASSOC,
 						(__u16)error, 0, 0, NULL,
 						GFP_ATOMIC);
 
@@ -716,7 +716,7 @@ static void sctp_cmd_transport_on(sctp_cmd_seq_t *cmds,
 	 * outstanding data and rely on the retransmission limit be reached
 	 * to shutdown the association.
 	 */
-	if (t->asoc->state != SCTP_STATE_SHUTDOWN_PENDING)
+	if (t->asoc->state < SCTP_STATE_SHUTDOWN_PENDING)
 		t->asoc->overall_error_count = 0;
 
 	/* Clear the hb_sent flag to signal that we had a good
@@ -963,7 +963,7 @@ static void sctp_cmd_del_non_primary(struct sctp_association *asoc)
 		t = list_entry(pos, struct sctp_transport, transports);
 		if (!sctp_cmp_addr_exact(&t->ipaddr,
 					 &asoc->peer.primary_addr)) {
-			sctp_assoc_del_peer(asoc, &t->ipaddr);
+			sctp_assoc_rm_peer(asoc, t);
 		}
 	}
 }

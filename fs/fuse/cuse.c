@@ -95,7 +95,7 @@ static ssize_t cuse_read(struct file *file, char __user *buf, size_t count,
 	struct iovec iov = { .iov_base = buf, .iov_len = count };
 	struct fuse_io_priv io = { .async = 0, .file = file };
 
-	return fuse_direct_io(&io, &iov, 1, count, &pos, 0);
+	return fuse_direct_io(&io, &iov, 1, count, &pos, FUSE_DIO_CUSE);
 }
 
 static ssize_t cuse_write(struct file *file, const char __user *buf,
@@ -109,7 +109,8 @@ static ssize_t cuse_write(struct file *file, const char __user *buf,
 	 * No locking or generic_write_checks(), the server is
 	 * responsible for locking and sanity checks.
 	 */
-	return fuse_direct_io(&io, &iov, 1, count, &pos, 1);
+	return fuse_direct_io(&io, &iov, 1, count, &pos,
+			      FUSE_DIO_WRITE | FUSE_DIO_CUSE);
 }
 
 static int cuse_open(struct inode *inode, struct file *file)
@@ -473,7 +474,7 @@ err:
 static void cuse_fc_release(struct fuse_conn *fc)
 {
 	struct cuse_conn *cc = fc_to_cc(fc);
-	kfree(cc);
+	kfree_rcu(cc, fc.rcu);
 }
 
 /**
@@ -546,6 +547,8 @@ static int cuse_channel_release(struct inode *inode, struct file *file)
 		unregister_chrdev_region(cc->cdev->dev, 1);
 		cdev_del(cc->cdev);
 	}
+	/* Base reference is now owned by "fud" */
+	fuse_conn_put(&cc->fc);
 
 	rc = fuse_dev_release(inode, file);	/* puts the base reference */
 
@@ -580,16 +583,19 @@ static ssize_t cuse_class_abort_store(struct device *dev,
 }
 
 static struct device_attribute cuse_class_dev_attrs[] = {
-	__ATTR(waiting, S_IFREG | 0400, cuse_class_waiting_show, NULL),
-	__ATTR(abort, S_IFREG | 0200, NULL, cuse_class_abort_store),
+	__ATTR(waiting, 0400, cuse_class_waiting_show, NULL),
+	__ATTR(abort, 0200, NULL, cuse_class_abort_store),
 	{ }
 };
 
 static struct miscdevice cuse_miscdev = {
-	.minor		= MISC_DYNAMIC_MINOR,
+	.minor		= CUSE_MINOR,
 	.name		= "cuse",
 	.fops		= &cuse_channel_fops,
 };
+
+MODULE_ALIAS_MISCDEV(CUSE_MINOR);
+MODULE_ALIAS("devname:cuse");
 
 static int __init cuse_init(void)
 {
@@ -604,6 +610,8 @@ static int __init cuse_init(void)
 	cuse_channel_fops.owner		= THIS_MODULE;
 	cuse_channel_fops.open		= cuse_channel_open;
 	cuse_channel_fops.release	= cuse_channel_release;
+	/* CUSE is not prepared for FUSE_DEV_IOC_CLONE */
+	cuse_channel_fops.unlocked_ioctl	= NULL;
 
 	cuse_class = class_create(THIS_MODULE, "cuse");
 	if (IS_ERR(cuse_class))

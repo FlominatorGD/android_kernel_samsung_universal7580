@@ -45,12 +45,6 @@
 #include "sd_ops.h"
 #include "sdio_ops.h"
 
-#ifdef CONFIG_MMC_SUPPORT_STLOG
-#include <linux/stlog.h>
-#else
-#define ST_LOG(fmt,...)
-#endif
-
 /* If the device is not responding */
 #define MMC_CORE_TIMEOUT_MS	(10 * 60 * 1000) /* 10 minute timeout */
 
@@ -61,7 +55,7 @@
 #define MMC_BKOPS_MAX_TIMEOUT	(4 * 60 * 1000) /* max time to wait in ms */
 
 static struct workqueue_struct *workqueue;
-static const unsigned freqs[] = {400000, 300000};
+static const unsigned freqs[] = { 400000, 300000 };
 
 /*
  * Enabling software CRCs on the data blocks can be a significant (30%)
@@ -905,7 +899,7 @@ void mmc_wait_for_req(struct mmc_host *host, struct mmc_request *mrq)
 #ifdef CONFIG_MMC_BLOCK_DEFERRED_RESUME
 	if (mmc_bus_needs_resume(host))
 		mmc_resume_bus(host);
-#endif	
+#endif
 	__mmc_start_req(host, mrq);
 	mmc_wait_for_req_done(host, mrq);
 }
@@ -1709,7 +1703,7 @@ int mmc_set_signal_voltage(struct mmc_host *host, int signal_voltage)
 
 	err = mmc_wait_for_cmd(host, &cmd, 0);
 	if (err)
-		return err;
+		goto power_cycle;
 
 	if (!mmc_host_is_spi(host) && (cmd.resp[0] & R1_ERROR))
 		return -EIO;
@@ -2703,7 +2697,6 @@ int _mmc_detect_card_removed(struct mmc_host *host)
 	if (ret) {
 		mmc_card_set_removed(host->card);
 		pr_debug("%s: card remove detected\n", mmc_hostname(host));
-		ST_LOG("<%s> %s: card remove detected\n", __func__,mmc_hostname(host));
 	}
 
 	return ret;
@@ -2815,7 +2808,6 @@ void mmc_rescan(struct work_struct *work)
 		goto out;
 	}
 
-	ST_LOG("<%s> %s insertion detected",__func__,host->class_dev.kobj.name);
 	mmc_claim_host(host);
 	for (i = 0; i < ARRAY_SIZE(freqs); i++) {
 		if (!mmc_rescan_try_freq(host, max(freqs[i], host->f_min))) {
@@ -3081,14 +3073,8 @@ int mmc_suspend_host(struct mmc_host *host)
 
 	mmc_bus_get(host);
 	if (host->bus_ops && !host->bus_dead) {
-		if (host->bus_ops->suspend) {
-			if (mmc_card_doing_bkops(host->card)) {
-				err = mmc_stop_bkops(host->card);
-				if (err)
-					goto out;
-			}
+		if (host->bus_ops->suspend)
 			err = host->bus_ops->suspend(host);
-		}
 
 		if (err == -ENOSYS || !host->bus_ops->resume) {
 			/*
@@ -3112,10 +3098,8 @@ int mmc_suspend_host(struct mmc_host *host)
 	if (!err && !mmc_card_keep_power(host))
 		mmc_power_off(host);
 
-out:
 	return err;
 }
-
 EXPORT_SYMBOL(mmc_suspend_host);
 
 /**
@@ -3176,22 +3160,10 @@ int mmc_pm_notify(struct notifier_block *notify_block,
 	struct mmc_host *host = container_of(
 		notify_block, struct mmc_host, pm_notify);
 	unsigned long flags;
-	int err = 0;
 
 	switch (mode) {
 	case PM_HIBERNATION_PREPARE:
 	case PM_SUSPEND_PREPARE:
-		if (host->card && mmc_card_mmc(host->card) &&
-		    mmc_card_doing_bkops(host->card)) {
-			err = mmc_stop_bkops(host->card);
-			if (err) {
-				pr_err("%s: didn't stop bkops\n",
-					mmc_hostname(host));
-				return err;
-			}
-			mmc_card_clr_doing_bkops(host->card);
-		}
-
 		spin_lock_irqsave(&host->lock, flags);
 		if (mmc_bus_needs_resume(host)) {
 			spin_unlock_irqrestore(&host->lock, flags);
@@ -3234,81 +3206,6 @@ int mmc_pm_notify(struct notifier_block *notify_block,
 	return 0;
 }
 #endif
-
-#define MIN_WAIT_MS	5
-static int mmc_wait_trans_state(struct mmc_card *card, unsigned int wait_ms)
-{
-	int waited = 0;
-	int status = 0;
-
-	mmc_send_status(card, &status, 0);
-
-	while (R1_CURRENT_STATE(status) != R1_STATE_TRAN) {
-		if (waited > wait_ms)
-			return 0;
-		mdelay(MIN_WAIT_MS);
-		waited += MIN_WAIT_MS;
-		mmc_send_status(card, &status, 0);
-	}
-	return waited;
-}
-
-/*
- * Turn the bkops mode ON/OFF.
- */
-int mmc_bkops_enable(struct mmc_host *host, u8 value)
-{
-	struct mmc_card *card = host->card;
-	unsigned long flags;
-	int err = 0;
-	u8 ext_csd[512];
-
-	if (!card)
-		return err;
-
-	mmc_claim_host(host);
-
-	/* read ext_csd to get EXT_CSD_BKOPS_EN field value */
-	err = mmc_send_ext_csd(card, ext_csd);
-	if (err) {
-		mmc_wait_trans_state(card, 100);
-		err = mmc_send_ext_csd(card, ext_csd);
-		if (err) {
-			pr_err("%s: error %d sending ext_csd\n",
-					mmc_hostname(card->host), err);
-			goto bkops_out;
-		}
-	}
-
-	/* set value to put EXT_CSD_BKOPS_EN field */
-	value |= ext_csd[EXT_CSD_BKOPS_EN] & 0x1;
-	err = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
-			 EXT_CSD_BKOPS_EN, value,
-			 card->ext_csd.generic_cmd6_time);
-	if (err) {
-		pr_err("%s: bkops mode error %d\n", mmc_hostname(host), err);
-		goto bkops_out;
-	}
-
-	/* read ext_csd again to get EXT_CSD_BKOPS_EN field value */
-	mmc_wait_trans_state(card, 20);
-	err = mmc_send_ext_csd(card, ext_csd);
-
-	if (!err) {
-		spin_lock_irqsave(&card->bkops_lock, flags);
-		card->bkops_enable = ext_csd[EXT_CSD_BKOPS_EN];
-		spin_unlock_irqrestore(&card->bkops_lock, flags);
-	} else {
-		pr_err("%s: error %d confirming ext_csd value\n",
-				mmc_hostname(card->host), err);
-	}
-
-bkops_out:
-	mmc_release_host(host);
-
-	return err;
-}
-EXPORT_SYMBOL(mmc_bkops_enable);
 
 /**
  * mmc_init_context_info() - init synchronization context

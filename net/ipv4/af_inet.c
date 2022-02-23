@@ -89,6 +89,7 @@
 #include <linux/netfilter_ipv4.h>
 #include <linux/random.h>
 #include <linux/slab.h>
+#include <linux/netfilter/xt_qtaguid.h>
 
 #include <asm/uaccess.h>
 
@@ -449,6 +450,9 @@ int inet_release(struct socket *sock)
 	if (sk) {
 		long timeout;
 
+#ifdef CONFIG_NETFILTER_XT_MATCH_QTAGUID
+		qtaguid_untag(sock, true);
+#endif
 		sock_rps_reset_flow(sk);
 
 		/* Applications forget to leave groups before exiting */
@@ -1550,18 +1554,6 @@ int snmp_mib_init(void __percpu *ptr[2], size_t mibsize, size_t align)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(snmp_mib_init);
-
-void snmp_mib_free(void __percpu *ptr[SNMP_ARRAY_SZ])
-{
-	int i;
-
-	BUG_ON(ptr == NULL);
-	for (i = 0; i < SNMP_ARRAY_SZ; i++) {
-		free_percpu(ptr[i]);
-		ptr[i] = NULL;
-	}
-}
-EXPORT_SYMBOL_GPL(snmp_mib_free);
 
 #ifdef CONFIG_IP_MULTICAST
 static const struct net_protocol igmp_protocol = {

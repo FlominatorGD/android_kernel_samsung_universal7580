@@ -92,6 +92,10 @@ static void sync_timeline_free(struct kref *kref)
 void sync_timeline_destroy(struct sync_timeline *obj)
 {
 	obj->destroyed = true;
+	/*
+	 * Ensure timeline is marked as destroyed before
+	 * changing timeline's fences status.
+	 */
 	smp_wmb();
 
 	/*
@@ -699,8 +703,7 @@ static unsigned int sync_fence_poll(struct file *file, poll_table *wait)
 		return POLLIN;
 	else if (fence->status < 0)
 		return POLLERR;
-	else
-		return 0;
+	return 0;
 }
 
 static long sync_fence_ioctl_wait(struct sync_fence *fence, unsigned long arg)
@@ -715,7 +718,7 @@ static long sync_fence_ioctl_wait(struct sync_fence *fence, unsigned long arg)
 
 static long sync_fence_ioctl_merge(struct sync_fence *fence, unsigned long arg)
 {
-	int fd = get_unused_fd();
+	int fd = get_unused_fd_flags(O_CLOEXEC);
 	int err;
 	struct sync_fence *fence2, *fence3;
 	struct sync_merge_data data;

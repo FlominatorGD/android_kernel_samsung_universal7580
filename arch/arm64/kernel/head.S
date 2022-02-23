@@ -47,7 +47,7 @@
 #endif
 #endif
 
-#define SWAPPER_DIR_SIZE	(3 * PAGE_SIZE)
+#define SWAPPER_DIR_SIZE	(2 * PAGE_SIZE)
 #define IDMAP_DIR_SIZE		(2 * PAGE_SIZE)
 
 	.globl	swapper_pg_dir
@@ -129,31 +129,41 @@ ENTRY(stext)
 	ands	w7, w8, #0xf
 	bne	secondary_holding_pen
 #endif
-	mov	x21, x0				// x21=FDT
+	bl	preserve_boot_args
 	bl	el2_setup			// Drop to EL1, w20=cpu_boot_mode
 	bl	__calc_phys_offset		// x24=PHYS_OFFSET, x28=PHYS_OFFSET-PAGE_OFFSET
 	bl	set_cpu_boot_mode_flag
-	mrs	x22, midr_el1			// x22=cpuid
-	mov	x0, x22
-	bl	lookup_processor_type
-	mov	x23, x0				// x23=current cpu_table
-	cbz	x23, __error_p			// invalid processor (x23=0)?
+
 	bl	__vet_fdt
 	bl	__create_page_tables		// x25=TTBR0, x26=TTBR1
 	/*
-	 * The following calls CPU specific code in a position independent
-	 * manner. See arch/arm64/mm/proc.S for details. x23 = base of
-	 * cpu_info structure selected by lookup_processor_type above.
+	 * The following calls CPU setup code, see arch/arm64/mm/proc.S for
+	 * details.
 	 * On return, the CPU will be ready for the MMU to be turned on and
 	 * the TCR will have been set.
 	 */
 	ldr	x27, __switch_data		// address to jump to after
 						// MMU has been enabled
 	adr	lr, __enable_mmu		// return (PIC) address
-	ldr	x12, [x23, #CPU_INFO_SETUP]
-	add	x12, x12, x28			// __virt_to_phys
-	br	x12				// initialise processor
+	b	__cpu_setup			// initialise processor
 ENDPROC(stext)
+
+/*
+ * Preserve the arguments passed by the bootloader in x0 .. x3
+ */
+preserve_boot_args:
+	mov	x21, x0				// x21=FDT
+
+	adr_l	x0, boot_args			// record the contents of
+	stp	x21, x1, [x0]			// x0 .. x3 at kernel entry
+	stp	x2, x3, [x0, #16]
+
+	dmb	sy				// needed before dc ivac with
+						// MMU off
+
+	add	x1, x0, #0x20			// 4 x 8 bytes
+	b	__inval_cache_range		// tail call
+ENDPROC(preserve_boot_args)
 
 /*
  * If we're fortunate enough to boot at EL2, ensure that the world is
@@ -210,15 +220,21 @@ CPU_LE(	movk	x0, #0x30d0, lsl #16	)	// Clear EE and E0E on LE systems
 #endif
 
 	/* EL2 debug */
+	mrs	x0, id_aa64dfr0_el1		// Check ID_AA64DFR0_EL1 PMUVer
+	sbfx	x0, x0, #8, #4
+	cmp	x0, #1
+	b.lt	4f				// Skip if no PMU present
 	mrs	x0, pmcr_el0			// Disable debug access traps
 	ubfx	x0, x0, #11, #5			// to EL2 and allow access to
 	msr	mdcr_el2, x0			// all PMU counters from EL1
+4:
 
 	/* Stage-2 translation */
 	msr	vttbr_el2, xzr
 
 	/* Hypervisor stub */
-	adr	x0, __hyp_stub_vectors
+	adrp	x0, __hyp_stub_vectors
+	add	x0, x0, #:lo12:__hyp_stub_vectors
 	msr	vbar_el2, x0
 
 	/* spsr */
@@ -277,10 +293,7 @@ ENTRY(secondary_holding_pen)
 	mrs	x0, mpidr_el1
 	ldr     x1, =MPIDR_HWID_BITMASK
 	and	x0, x0, x1
-	adr	x1, 1b
-	ldp	x2, x3, [x1]
-	sub	x1, x1, x2
-	add	x3, x3, x1
+	adr_l	x3, secondary_holding_pen_release
 pen:	ldr	x4, [x3]
 	cmp	x4, x0
 	b.eq	secondary_startup
@@ -303,16 +316,8 @@ ENTRY(secondary_startup)
 	/*
 	 * Common entry point for secondary CPUs.
 	 */
-	mrs	x22, midr_el1			// x22=cpuid
-	mov	x0, x22
-	bl	lookup_processor_type
-	mov	x23, x0				// x23=current cpu_table
-	cbz	x23, __error_p			// invalid processor (x23=0)?
-
 	pgtbl	x25, x26, x24			// x25=TTBR0, x26=TTBR1
-	ldr	x12, [x23, #CPU_INFO_SETUP]
-	add	x12, x12, x28			// __virt_to_phys
-	blr	x12				// initialise processor
+	bl	__cpu_setup			// initialise processor
 
 	ldr	x21, =secondary_data
 	ldr	x27, =__secondary_switched	// address to jump to after enabling the MMU
@@ -355,6 +360,14 @@ ENDPROC(__enable_mmu)
 	.align	6
 __turn_mmu_on:
 	msr	sctlr_el1, x0
+	isb
+	/*
+	 * Invalidate the local I-cache so that any instructions fetched
+	 * speculatively from the PoC are discarded, since they may have
+	 * been dynamically patched at the PoU.
+	 */
+	ic	iallu
+	dsb	nsh
 	isb
 	br	x27
 ENDPROC(__turn_mmu_on)
@@ -472,12 +485,6 @@ __create_page_tables:
 	sub	x6, x6, #1			// inclusive range
 	create_block_map x0, x7, x3, x5, x6
 1:
-	/*
-	 * Create the pgd entry for the fixed mappings.
-	 */
-	ldr	x5, =FIXADDR_TOP		// Fixed mapping virtual address
-	add	x0, x26, #2 * PAGE_SIZE		// section table address
-	create_pgd_entry x26, x0, x5, x6, x7
 	ret
 ENDPROC(__create_page_tables)
 	.ltorg
@@ -488,7 +495,6 @@ __switch_data:
 	.quad	__mmap_switched
 	.quad	__bss_start			// x6
 	.quad	_end				// x7
-	.quad	processor_id			// x4
 	.quad	__fdt_pointer			// x5
 	.quad	memstart_addr			// x6
 	.quad	init_thread_union + THREAD_START_SP // sp
@@ -500,78 +506,21 @@ __switch_data:
 __mmap_switched:
 	adr	x3, __switch_data + 8
 
-#ifdef CONFIG_TIMA_RKP
-	ldr	x6, =rkp_map_bitmap
-	add	x7, x6, 0x18000
-3:	cmp	x6, x7
-	b.hs	4f
-	str	xzr, [x6], #8			// Clear BSS
-	b	3b
-#endif
 4:	ldp	x6, x7, [x3], #16
 1:	cmp	x6, x7
 	b.hs	2f
 	str	xzr, [x6], #8			// Clear BSS
 	b	1b
 2:
-	ldp	x4, x5, [x3], #16
+	ldr	x5, [x3], #8
 	ldr	x6, [x3], #8
 	ldr	x16, [x3]
 	mov	sp, x16
-	str	x22, [x4]			// Save processor ID
 	str	x21, [x5]			// Save FDT pointer
 	str	x24, [x6]			// Save PHYS_OFFSET
 	mov	x29, #0
 	b	start_kernel
 ENDPROC(__mmap_switched)
-
-/*
- * Exception handling. Something went wrong and we can't proceed. We ought to
- * tell the user, but since we don't have any guarantee that we're even
- * running on the right architecture, we do virtually nothing.
- */
-__error_p:
-ENDPROC(__error_p)
-
-__error:
-1:	nop
-	b	1b
-ENDPROC(__error)
-
-/*
- * This function gets the processor ID in w0 and searches the cpu_table[] for
- * a match. It returns a pointer to the struct cpu_info it found. The
- * cpu_table[] must end with an empty (all zeros) structure.
- *
- * This routine can be called via C code and it needs to work with the MMU
- * both disabled and enabled (the offset is calculated automatically).
- */
-ENTRY(lookup_processor_type)
-	adr	x1, __lookup_processor_type_data
-	ldp	x2, x3, [x1]
-	sub	x1, x1, x2			// get offset between VA and PA
-	add	x3, x3, x1			// convert VA to PA
-1:
-	ldp	w5, w6, [x3]			// load cpu_id_val and cpu_id_mask
-	cbz	w5, 2f				// end of list?
-	and	w6, w6, w0
-	cmp	w5, w6
-	b.eq	3f
-	add	x3, x3, #CPU_INFO_SZ
-	b	1b
-2:
-	mov	x3, #0				// unknown processor
-3:
-	mov	x0, x3
-	ret
-ENDPROC(lookup_processor_type)
-
-	.align	3
-	.type	__lookup_processor_type_data, %object
-__lookup_processor_type_data:
-	.quad	.
-	.quad	cpu_table
-	.size	__lookup_processor_type_data, . - __lookup_processor_type_data
 
 /*
  * Determine validity of the x21 FDT pointer.

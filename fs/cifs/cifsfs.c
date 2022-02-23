@@ -207,7 +207,7 @@ cifs_statfs(struct dentry *dentry, struct kstatfs *buf)
 		rc = server->ops->queryfs(xid, tcon, buf);
 
 	free_xid(xid);
-	return 0;
+	return rc;
 }
 
 static int cifs_permission(struct inode *inode, int mask)
@@ -521,6 +521,7 @@ static int cifs_show_stats(struct seq_file *s, struct dentry *root)
 
 static int cifs_remount(struct super_block *sb, int *flags, char *data)
 {
+	sync_filesystem(sb);
 	*flags |= MS_NODIRATIME;
 	return 0;
 }
@@ -772,7 +773,7 @@ static loff_t cifs_llseek(struct file *file, loff_t offset, int whence)
 
 static int cifs_setlease(struct file *file, long arg, struct file_lock **lease)
 {
-	/* note that this is called by vfs setlease with lock_flocks held
+	/* note that this is called by vfs setlease with i_lock held
 	   to protect *lease from going away */
 	struct inode *inode = file_inode(file);
 	struct cifsFileInfo *cfile = file->private_data;
@@ -848,7 +849,7 @@ const struct inode_operations cifs_file_inode_ops = {
 const struct inode_operations cifs_symlink_inode_ops = {
 	.readlink = generic_readlink,
 	.follow_link = cifs_follow_link,
-	.put_link = cifs_put_link,
+	.put_link = kfree_put_link,
 	.permission = cifs_permission,
 	/* BB add the following two eventually */
 	/* revalidate: cifs_revalidate,
@@ -975,7 +976,7 @@ const struct file_operations cifs_file_direct_nobrl_ops = {
 };
 
 const struct file_operations cifs_dir_ops = {
-	.readdir = cifs_readdir,
+	.iterate = cifs_readdir,
 	.release = cifs_closedir,
 	.read    = generic_read_dir,
 	.unlocked_ioctl  = cifs_ioctl,

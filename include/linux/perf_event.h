@@ -48,6 +48,7 @@ struct perf_guest_info_callbacks {
 #include <linux/cpu.h>
 #include <linux/irq_work.h>
 #include <linux/static_key.h>
+#include <linux/jump_label_ratelimit.h>
 #include <linux/atomic.h>
 #include <linux/sysfs.h>
 #include <linux/perf_regs.h>
@@ -808,7 +809,7 @@ static inline void perf_restore_debug_store(void)			{ }
 #define perf_output_put(handle, x) perf_output_copy((handle), &(x), sizeof(x))
 
 /*
- * This has to have a higher priority than migration_notifier in sched.c.
+ * This has to have a higher priority than migration_notifier in sched/core.c.
  */
 #define perf_cpu_notifier(fn)						\
 do {									\

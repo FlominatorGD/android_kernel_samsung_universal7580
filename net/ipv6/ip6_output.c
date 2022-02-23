@@ -342,6 +342,12 @@ static int ip6_forward_proxy_check(struct sk_buff *skb)
 
 static inline int ip6_forward_finish(struct sk_buff *skb)
 {
+	struct dst_entry *dst = skb_dst(skb);
+	struct net *net = dev_net(dst->dev);
+
+	IP6_INC_STATS_BH(net, ip6_dst_idev(dst), IPSTATS_MIB_OUTFORWDATAGRAMS);
+	IP6_ADD_STATS_BH(net, ip6_dst_idev(dst), IPSTATS_MIB_OUTOCTETS, skb->len);
+
 	return dst_output(skb);
 }
 
@@ -508,8 +514,6 @@ int ip6_forward(struct sk_buff *skb)
 
 	hdr->hop_limit--;
 
-	IP6_INC_STATS_BH(net, ip6_dst_idev(dst), IPSTATS_MIB_OUTFORWDATAGRAMS);
-	IP6_ADD_STATS_BH(net, ip6_dst_idev(dst), IPSTATS_MIB_OUTOCTETS, skb->len);
 	return NF_HOOK(NFPROTO_IPV6, NF_INET_FORWARD, skb, skb->dev, dst->dev,
 		       ip6_forward_finish);
 
@@ -540,18 +544,23 @@ static void ip6_copy_metadata(struct sk_buff *to, struct sk_buff *from)
 	skb_copy_secmark(to, from);
 }
 
-static void ipv6_select_ident(struct frag_hdr *fhdr, struct rt6_info *rt)
+void ipv6_select_ident(struct net *net, struct frag_hdr *fhdr, struct rt6_info *rt)
 {
-	static u32 ip6_idents_hashrnd __read_mostly;
-	static bool hashrnd_initialized = false;
+	const struct {
+		struct in6_addr dst;
+		struct in6_addr src;
+	} __aligned(SIPHASH_ALIGNMENT) combined = {
+		.dst = rt->rt6i_dst.addr,
+		.src = rt->rt6i_src.addr,
+	};
 	u32 hash, id;
 
-	if (unlikely(!hashrnd_initialized)) {
-		hashrnd_initialized = true;
-		get_random_bytes(&ip6_idents_hashrnd, sizeof(ip6_idents_hashrnd));
-	}
-	hash = __ipv6_addr_jhash(&rt->rt6i_dst.addr, ip6_idents_hashrnd);
-	hash = __ipv6_addr_jhash(&rt->rt6i_src.addr, hash);
+	/* Note the following code is not safe, but this is okay. */
+	if (unlikely(siphash_key_is_zero(&net->ipv4.ip_id_key)))
+		get_random_bytes(&net->ipv4.ip_id_key,
+				 sizeof(net->ipv4.ip_id_key));
+
+	hash = siphash(&combined, sizeof(combined), &net->ipv4.ip_id_key);
 
 	id = ip_idents_reserve(hash, 1);
 	fhdr->identification = htonl(id);
@@ -647,7 +656,7 @@ int ip6_fragment(struct sk_buff *skb, int (*output)(struct sk_buff *))
 		skb_reset_network_header(skb);
 		memcpy(skb_network_header(skb), tmp_hdr, hlen);
 
-		ipv6_select_ident(fh, rt);
+		ipv6_select_ident(net, fh, rt);
 		fh->nexthdr = nexthdr;
 		fh->reserved = 0;
 		fh->frag_off = htons(IP6_MF);
@@ -805,7 +814,7 @@ slow_path:
 		fh->nexthdr = nexthdr;
 		fh->reserved = 0;
 		if (!frag_id) {
-			ipv6_select_ident(fh, rt);
+			ipv6_select_ident(net, fh, rt);
 			frag_id = fh->identification;
 		} else
 			fh->identification = frag_id;
@@ -1108,7 +1117,7 @@ static inline int ip6_ufo_append_data(struct sock *sk,
 		skb_shinfo(skb)->gso_size = (mtu - fragheaderlen -
 					     sizeof(struct frag_hdr)) & ~7;
 		skb_shinfo(skb)->gso_type = SKB_GSO_UDP;
-		ipv6_select_ident(&fhdr, rt);
+		ipv6_select_ident(sock_net(sk), &fhdr, rt);
 		skb_shinfo(skb)->ip6_frag_id = fhdr.identification;
 		__skb_queue_tail(&sk->sk_write_queue, skb);
 	}
@@ -1220,10 +1229,10 @@ int ip6_append_data(struct sock *sk, int getfrag(void *from, char *to,
 		np->cork.tclass = tclass;
 		if (rt->dst.flags & DST_XFRM_TUNNEL)
 			mtu = np->pmtudisc == IPV6_PMTUDISC_PROBE ?
-			      ACCESS_ONCE(rt->dst.dev->mtu) : dst_mtu(&rt->dst);
+			      READ_ONCE(rt->dst.dev->mtu) : dst_mtu(&rt->dst);
 		else
 			mtu = np->pmtudisc == IPV6_PMTUDISC_PROBE ?
-			      ACCESS_ONCE(rt->dst.dev->mtu) : dst_mtu(rt->dst.path);
+			      READ_ONCE(rt->dst.dev->mtu) : dst_mtu(rt->dst.path);
 		if (np->frag_size < mtu) {
 			if (np->frag_size)
 				mtu = np->frag_size;

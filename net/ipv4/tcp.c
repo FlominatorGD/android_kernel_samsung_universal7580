@@ -268,7 +268,6 @@
 #include <linux/crypto.h>
 #include <linux/time.h>
 #include <linux/slab.h>
-#include <linux/uid_stat.h>
 
 #include <net/icmp.h>
 #include <net/inet_common.h>
@@ -283,6 +282,7 @@
 
 #include <asm/uaccess.h>
 #include <asm/ioctls.h>
+#include <asm/unaligned.h>
 
 int sysctl_tcp_fin_timeout __read_mostly = TCP_FIN_TIMEOUT;
 
@@ -815,8 +815,8 @@ static unsigned int tcp_xmit_size_goal(struct sock *sk, u32 mss_now,
 		gso_size = max_t(u32, gso_size,
 				 sysctl_tcp_min_tso_segs * mss_now);
 
-		xmit_size_goal = min_t(u32, xmit_size_goal,
-				       sysctl_tcp_limit_output_bytes >> 1);
+		xmit_size_goal = min_t(u32, gso_size,
+				       sk->sk_gso_max_size - 1 - hlen);
 
 		xmit_size_goal = tcp_bound_to_half_wnd(tp, xmit_size_goal);
 
@@ -1251,9 +1251,6 @@ out:
 		tcp_push(sk, flags, mss_now, tp->nonagle);
 out_nopush:
 	release_sock(sk);
-
-	if (copied + copied_syn)
-		uid_stat_tcp_snd(current_uid(), copied + copied_syn);
 	return copied + copied_syn;
 
 do_fault:
@@ -1558,7 +1555,6 @@ int tcp_read_sock(struct sock *sk, read_descriptor_t *desc,
 	if (copied > 0) {
 		tcp_recv_skb(sk, seq, &offset);
 		tcp_cleanup_rbuf(sk, copied);
-		uid_stat_tcp_rcv(current_uid(), copied);
 	}
 	return copied;
 }
@@ -1963,9 +1959,6 @@ skip_copy:
 	tcp_cleanup_rbuf(sk, copied);
 
 	release_sock(sk);
-
-	if (copied > 0)
-		uid_stat_tcp_rcv(current_uid(), copied);
 	return copied;
 
 out:
@@ -1974,8 +1967,6 @@ out:
 
 recv_urg:
 	err = tcp_recv_urg(sk, msg, len, flags);
-	if (err > 0)
-		uid_stat_tcp_rcv(current_uid(), err);
 	goto out;
 
 recv_sndq:
@@ -2326,6 +2317,7 @@ int tcp_disconnect(struct sock *sk, int flags)
 	tp->window_clamp = 0;
 	tcp_set_ca_state(sk, TCP_CA_Open);
 	tcp_clear_retrans(tp);
+	tp->total_retrans = 0;
 	inet_csk_delack_init(sk);
 	/* Initialize rcv_mss to TCP_MIN_MSS to avoid division by 0
 	 * issue in __tcp_select_window()
@@ -2336,8 +2328,18 @@ int tcp_disconnect(struct sock *sk, int flags)
 	__sk_dst_reset(sk);
 	dst_release(sk->sk_rx_dst);
 	sk->sk_rx_dst = NULL;
+	tp->segs_in = 0;
+	tp->segs_out = 0;
+	tp->bytes_acked = 0;
+	tp->bytes_received = 0;
 
 	WARN_ON(inet->inet_num && !icsk->icsk_bind_hash);
+
+	if (sk->sk_frag.page) {
+		put_page(sk->sk_frag.page);
+		sk->sk_frag.page = NULL;
+		sk->sk_frag.offset = 0;
+	}
 
 	sk->sk_error_report(sk);
 	return err;
@@ -2713,6 +2715,8 @@ void tcp_get_info(struct sock *sk, struct tcp_info *info)
 	const struct inet_connection_sock *icsk = inet_csk(sk);
 	u32 now = tcp_time_stamp;
 	unsigned int start;
+	u64 rate64;
+	u32 rate;
 
 	memset(info, 0, sizeof(*info));
 
@@ -2773,18 +2777,22 @@ void tcp_get_info(struct sock *sk, struct tcp_info *info)
 
 	info->tcpi_total_retrans = tp->total_retrans;
 
-	info->tcpi_pacing_rate = sk->sk_pacing_rate != ~0U ?
-					sk->sk_pacing_rate : ~0ULL;
-	info->tcpi_max_pacing_rate = sk->sk_max_pacing_rate != ~0U ?
-					sk->sk_max_pacing_rate : ~0ULL;
+	rate = READ_ONCE(sk->sk_pacing_rate);
+	rate64 = rate != ~0U ? rate : ~0ULL;
+	put_unaligned(rate64, &info->tcpi_pacing_rate);
+
+	rate = READ_ONCE(sk->sk_max_pacing_rate);
+	rate64 = rate != ~0U ? rate : ~0ULL;
+	put_unaligned(rate64, &info->tcpi_max_pacing_rate);
 
 	do {
 		start = u64_stats_fetch_begin_irq(&tp->syncp);
-		info->tcpi_bytes_acked = tp->bytes_acked;
-		info->tcpi_bytes_received = tp->bytes_received;
+		put_unaligned(tp->bytes_acked, &info->tcpi_bytes_acked);
+		put_unaligned(tp->bytes_received, &info->tcpi_bytes_received);
 	} while (u64_stats_fetch_retry_irq(&tp->syncp, start));
 	info->tcpi_segs_out = tp->segs_out;
 	info->tcpi_segs_in = tp->segs_in;
+
 }
 EXPORT_SYMBOL_GPL(tcp_get_info);
 
@@ -3464,6 +3472,7 @@ void __init tcp_init(void)
 	int max_rshare, max_wshare, cnt;
 	unsigned int i;
 
+	BUILD_BUG_ON(TCP_MIN_SND_MSS <= MAX_TCP_OPTION_SPACE);
 	BUILD_BUG_ON(sizeof(struct tcp_skb_cb) > sizeof(skb->cb));
 
 	percpu_counter_init(&tcp_sockets_allocated, 0);

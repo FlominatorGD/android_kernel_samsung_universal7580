@@ -45,12 +45,15 @@ extern void __init chrdev_init(void);
  * namei.c
  */
 extern int __inode_permission(struct inode *, int);
+extern int user_path_mountpoint_at(int, const char __user *, unsigned int, struct path *);
+extern int vfs_path_lookup(struct dentry *, struct vfsmount *,
+			   const char *, unsigned int, struct path *);
 
 /*
  * namespace.c
  */
 extern int copy_mount_options(const void __user *, unsigned long *);
-extern int copy_mount_string(const void __user *, char **);
+extern char *copy_mount_string(const void __user *);
 
 extern struct vfsmount *lookup_mnt(struct path *);
 extern int finish_automount(struct vfsmount *, struct path *);
@@ -117,8 +120,7 @@ extern void inode_add_lru(struct inode *inode);
  */
 extern void inode_wb_list_del(struct inode *inode);
 
-extern int get_nr_dirty_inodes(void);
-extern void evict_inodes(struct super_block *);
+extern long get_nr_dirty_inodes(void);
 extern int invalidate_inodes(struct super_block *, bool);
 
 /*

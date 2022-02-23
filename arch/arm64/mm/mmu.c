@@ -28,6 +28,7 @@
 #include <linux/io.h>
 
 #include <asm/cputype.h>
+#include <asm/fixmap.h>
 #include <asm/sections.h>
 #include <asm/setup.h>
 #include <asm/sizes.h>
@@ -40,95 +41,14 @@
 #include <linux/vmalloc.h>
 #include <asm/mach/arch.h>
 
-#ifdef CONFIG_RKP_KDP
-__attribute__((section (".tima.rkp.ro"))) int rkp_cred_enable = 0;
-EXPORT_SYMBOL(rkp_cred_enable);
-#endif /*CONFIG_RKP_KDP*/
-
 static int iotable_on;
-#ifdef CONFIG_KNOX_KAP
-extern int boot_mode_security;
-#endif
+
 /*
  * Empty_zero_page is a special page that is used for zero-initialized data
  * and COW.
  */
 struct page *empty_zero_page;
 EXPORT_SYMBOL(empty_zero_page);
-
-struct cachepolicy {
-	const char	policy[16];
-	u64		mair;
-	u64		tcr;
-};
-
-static struct cachepolicy cache_policies[] __initdata = {
-	{
-		.policy		= "uncached",
-		.mair		= 0x44,			/* inner, outer non-cacheable */
-		.tcr		= TCR_IRGN_NC | TCR_ORGN_NC,
-	}, {
-		.policy		= "writethrough",
-		.mair		= 0xaa,			/* inner, outer write-through, read-allocate */
-		.tcr		= TCR_IRGN_WT | TCR_ORGN_WT,
-	}, {
-		.policy		= "writeback",
-		.mair		= 0xee,			/* inner, outer write-back, read-allocate */
-		.tcr		= TCR_IRGN_WBnWA | TCR_ORGN_WBnWA,
-	}
-};
-
-/*
- * These are useful for identifying cache coherency problems by allowing the
- * cache or the cache and writebuffer to be turned off. It changes the Normal
- * memory caching attributes in the MAIR_EL1 register.
- */
-static int __init early_cachepolicy(char *p)
-{
-	int i;
-	u64 tmp;
-
-	for (i = 0; i < ARRAY_SIZE(cache_policies); i++) {
-		int len = strlen(cache_policies[i].policy);
-
-		if (memcmp(p, cache_policies[i].policy, len) == 0)
-			break;
-	}
-	if (i == ARRAY_SIZE(cache_policies)) {
-		pr_err("ERROR: unknown or unsupported cache policy: %s\n", p);
-		return 0;
-	}
-
-	flush_cache_all();
-
-	/*
-	 * Modify MT_NORMAL attributes in MAIR_EL1.
-	 */
-	asm volatile(
-	"	mrs	%0, mair_el1\n"
-	"	bfi	%0, %1, #%2, #8\n"
-	"	msr	mair_el1, %0\n"
-	"	isb\n"
-	: "=&r" (tmp)
-	: "r" (cache_policies[i].mair), "i" (MT_NORMAL * 8));
-
-	/*
-	 * Modify TCR PTW cacheability attributes.
-	 */
-	asm volatile(
-	"	mrs	%0, tcr_el1\n"
-	"	bic	%0, %0, %2\n"
-	"	orr	%0, %0, %1\n"
-	"	msr	tcr_el1, %0\n"
-	"	isb\n"
-	: "=&r" (tmp)
-	: "r" (cache_policies[i].tcr), "r" (TCR_IRGN_MASK | TCR_ORGN_MASK));
-
-	flush_cache_all();
-
-	return 0;
-}
-early_param("cachepolicy", early_cachepolicy);
 
 pgprot_t phys_mem_access_prot(struct file *file, unsigned long pfn,
 			      unsigned long size, pgprot_t vma_prot)
@@ -148,105 +68,17 @@ static void __init *early_alloc(unsigned long sz)
 	return ptr;
 }
 
-#ifdef CONFIG_TIMA_RKP
-/* Extra memory needed by VMM */
-void* vmm_extra_mem = 0;
-spinlock_t ro_rkp_pages_lock = __SPIN_LOCK_UNLOCKED();
-char ro_pages_stat[RO_PAGES] = {0};
-unsigned ro_alloc_last = 0; 
-int rkp_ro_mapped = 0; 
-
-
-void *rkp_ro_alloc(void)
-{
-	unsigned long flags;
-	int i, j;
-	void * alloc_addr = NULL;
-	
-	spin_lock_irqsave(&ro_rkp_pages_lock,flags);
-	
-	for (i = 0, j = ro_alloc_last; i < (RO_PAGES) ; i++) {
-		j =  (j+1) %(RO_PAGES); 
-		if (!ro_pages_stat[j]) {
-			ro_pages_stat[j] = 1;
-			ro_alloc_last = j+1;
-			alloc_addr = (void*) ((u64)RKP_RBUF_VA +  (j << PAGE_SHIFT));
-			break;
-		}
-	}
-	spin_unlock_irqrestore(&ro_rkp_pages_lock,flags);
-	
-	return alloc_addr;
-}
-
-void rkp_ro_free(void *free_addr)
-{
-	int i;
-	unsigned long flags;
-
-	i =  ((u64)free_addr - (u64)RKP_RBUF_VA) >> PAGE_SHIFT;
-	spin_lock_irqsave(&ro_rkp_pages_lock,flags);
-	ro_pages_stat[i] = 0;
-	ro_alloc_last = i; 
-	spin_unlock_irqrestore(&ro_rkp_pages_lock,flags);
-}
-
-unsigned int is_rkp_ro_page(u64 addr)
-{
-	if( (addr >= (u64)RKP_RBUF_VA)
-		&& (addr < (u64)(RKP_RBUF_VA+ TIMA_ROBUF_SIZE)))
-		return 1;
-	else return 0;
-}
-/* we suppose the whole block remap to page table should start with block borders */
-static inline void __init block_to_pages(pmd_t *pmd, unsigned long addr,
-				  unsigned long end, unsigned long pfn)
-{
-	pte_t *old_pte;  
-	pmd_t new ; 
-	pte_t *pte = rkp_ro_alloc();	
-
-	old_pte = pte;
-
-	__pmd_populate(&new, __pa(pte), PMD_TYPE_TABLE); /* populate to temporary pmd */
-
-	pte = pte_offset_kernel(&new, addr);
-
-	do {		
-		if (iotable_on == 1)
-			set_pte(pte, pfn_pte(pfn, pgprot_iotable_init(PAGE_KERNEL_EXEC)));
-		else
-			set_pte(pte, pfn_pte(pfn, PAGE_KERNEL_EXEC));
-		pfn++;
-	} while (pte++, addr += PAGE_SIZE, addr != end);
-
-	__pmd_populate(pmd, __pa(old_pte), PMD_TYPE_TABLE);
-}
-#endif
 static void __init alloc_init_pte(pmd_t *pmd, unsigned long addr,
 				  unsigned long end, unsigned long pfn)
 {
 	pte_t *pte;
 
-#ifdef CONFIG_TIMA_RKP
-#ifdef CONFIG_KNOX_KAP
-	if(boot_mode_security)
-#endif
-	if(pmd_block(*pmd))
-		return block_to_pages(pmd, addr, end, pfn);
-#endif
 	if (pmd_none(*pmd)) {
 		pte = early_alloc(PTRS_PER_PTE * sizeof(pte_t));
 		__pmd_populate(pmd, __pa(pte), PMD_TYPE_TABLE);
 	}
-#ifdef CONFIG_TIMA_RKP
-#ifdef CONFIG_KNOX_KAP
-	if (!boot_mode_security)
-		BUG_ON(pmd_bad(*pmd));
-#endif
-#else
+
 	BUG_ON(pmd_bad(*pmd));
-#endif
 
 	pte = pte_offset_kernel(pmd, addr);
 	do {
@@ -263,27 +95,12 @@ static void __init alloc_init_pmd(pud_t *pud, unsigned long addr,
 {
 	pmd_t *pmd;
 	unsigned long next;
-#ifdef CONFIG_TIMA_RKP
-	int rkp_do = 0;
-#endif
+
 	/*
 	 * Check for initial section mappings in the pgd/pud and remove them.
 	 */
 	if (pud_none(*pud) || pud_bad(*pud)) {
-#ifdef CONFIG_TIMA_RKP
-#ifdef CONFIG_KNOX_KAP
-		if (boot_mode_security)  rkp_do = 1;
-#else
-		rkp_do = 1;
-#endif
-		if( rkp_do ){
-			pmd = rkp_ro_alloc();
-		}else{
-			pmd = early_alloc(PTRS_PER_PMD * sizeof(pmd_t));
-		}
-#else	/* !CONFIG_TIMA_RKP */
 		pmd = early_alloc(PTRS_PER_PMD * sizeof(pmd_t));
-#endif
 		pud_populate(&init_mm, pud, pmd);
 	}
 
@@ -355,13 +172,7 @@ static void __init map_mem(void)
 {
 	struct memblock_region *reg;
 	phys_addr_t limit;
-	phys_addr_t start;
-	phys_addr_t end;
 
-#ifdef CONFIG_TIMA_RKP
-	phys_addr_t mid = 0x60000000;
-	int rkp_do = 0;
-#endif
 	/*
 	 * Temporarily limit the memblock range. We need to do this as
 	 * create_mapping requires puds, pmds and ptes to be allocated from
@@ -376,8 +187,8 @@ static void __init map_mem(void)
 
 	/* map all the memory banks */
 	for_each_memblock(memory, reg) {
-		start = reg->base;
-		end = start + reg->size;
+		phys_addr_t  start = reg->base;
+		phys_addr_t  end = start + reg->size;
 
 		if (start >= end)
 			break;
@@ -398,53 +209,9 @@ static void __init map_mem(void)
 		}
 #endif
 
-#ifdef CONFIG_TIMA_RKP
-#ifdef CONFIG_KNOX_KAP
-	if (boot_mode_security)  rkp_do = 1;
-#else
-	rkp_do = 1;
-#endif
-	if( rkp_do ){
-		create_mapping(start, __phys_to_virt(start), mid - start);
-		memset((void*)RKP_RBUF_VA, 0, TIMA_ROBUF_SIZE);
-		create_mapping(mid, __phys_to_virt(mid), end - mid);
-	}else{
 		create_mapping(start, __phys_to_virt(start), end - start);
-	}
-#else /* !CONFIG_TIMA_RKP */
-		create_mapping(start, __phys_to_virt(start), end - start);
-#endif
 	}
 
-#ifdef CONFIG_TIMA_RKP
-#ifdef CONFIG_KNOX_KAP
-	if (boot_mode_security) {
-#endif
-		vmm_extra_mem = early_alloc(0x600000);
-		/* Turn text boundries to page tables if needed */
-#if 0		
-		/*Disable temprarly to prevent S1 page tables break down*/
-		if ((u64) _text & (~PMD_MASK)) {
-				start = (phys_addr_t) __pa(_text) & PMD_MASK;
-				end = (phys_addr_t) __pa(_text);
-				create_mapping(start, __phys_to_virt(start), end - start);
-				start = (phys_addr_t) __pa(_text);
-				end = (phys_addr_t) ALIGN(__pa(_text), PMD_SIZE);
-				create_mapping(start, __phys_to_virt(start), end - start);
-		}
-		if ((u64) _etext & (~PMD_MASK)) {
-				start = (phys_addr_t) __pa(_etext) & PMD_MASK;
-				end = (phys_addr_t) __pa(_etext);
-				create_mapping(start, __phys_to_virt(start), end - start);
-				start = (phys_addr_t) __pa(_etext);
-				end = (phys_addr_t) ALIGN(__pa(_etext), PMD_SIZE);
-				create_mapping(start, __phys_to_virt(start), end - start);
-		}
-#endif		
-#ifdef CONFIG_KNOX_KAP
-	}
-#endif
-#endif
 	/* Limit no longer required. */
 	memblock_set_current_limit(MEMBLOCK_ALLOC_ANYWHERE);
 }
@@ -456,43 +223,21 @@ static void __init map_mem(void)
 void __init paging_init(struct machine_desc *mdesc)
 {
 	void *zero_page;
-#ifdef CONFIG_TIMA_RKP
-	int rkp_do =  0;
-#endif
+
 	map_mem();
 
-	if(mdesc->map_io)
+	if (mdesc->map_io)
 		mdesc->map_io();
 
-	/*
-	 * Finally flush the caches and tlb to ensure that we're in a
-	 * consistent state.
-	 */
-	flush_cache_all();
-	flush_tlb_all();
-
 	/* allocate the zero page. */
-	/* change zero page address */
-
-#ifdef CONFIG_TIMA_RKP
-#ifdef CONFIG_KNOX_KAP
-	if (boot_mode_security)
-		rkp_do = 1;
-#endif
-	if (rkp_do)
-		zero_page = rkp_ro_alloc();
-	else
-		zero_page = early_alloc(PAGE_SIZE);
-#else	/* !CONFIG_TIMA_RKP */
 	zero_page = early_alloc(PAGE_SIZE);
-#endif
 
 	bootmem_init();
 
 	empty_zero_page = virt_to_page(zero_page);
 
 	/* Ensure the zero page is visible to the page table walker */
-	dsb();
+	dsb(ishst);
 
 	/*
 	 * TTBR0 is only used for the identity mapping at this stage. Make it
@@ -588,6 +333,96 @@ void vmemmap_free(unsigned long start, unsigned long end)
 {
 }
 #endif	/* CONFIG_SPARSEMEM_VMEMMAP */
+
+static pte_t bm_pte[PTRS_PER_PTE] __page_aligned_bss;
+#ifndef CONFIG_ARM64_64K_PAGES
+static pmd_t bm_pmd[PTRS_PER_PMD] __page_aligned_bss;
+#endif
+
+static inline pud_t * fixmap_pud(unsigned long addr)
+{
+	pgd_t *pgd = pgd_offset_k(addr);
+
+	BUG_ON(pgd_none(*pgd) || pgd_bad(*pgd));
+
+	return pud_offset(pgd, addr);
+}
+
+static inline pmd_t * fixmap_pmd(unsigned long addr)
+{
+	pud_t *pud = fixmap_pud(addr);
+
+	BUG_ON(pud_none(*pud) || pud_bad(*pud));
+
+	return pmd_offset(pud, addr);
+}
+
+static inline pte_t * fixmap_pte(unsigned long addr)
+{
+	pmd_t *pmd = fixmap_pmd(addr);
+
+	BUG_ON(pmd_none(*pmd) || pmd_bad(*pmd));
+
+	return pte_offset_kernel(pmd, addr);
+}
+
+void __init early_fixmap_init(void)
+{
+	pgd_t *pgd;
+	pud_t *pud;
+	pmd_t *pmd;
+	unsigned long addr = FIXADDR_START;
+
+	pgd = pgd_offset_k(addr);
+	pgd_populate(&init_mm, pgd, bm_pud);
+	pud = pud_offset(pgd, addr);
+	pud_populate(&init_mm, pud, bm_pmd);
+	pmd = pmd_offset(pud, addr);
+	pmd_populate_kernel(&init_mm, pmd, bm_pte);
+
+	/*
+	 * The boot-ioremap range spans multiple pmds, for which
+	 * we are not preparted:
+	 */
+	BUILD_BUG_ON((__fix_to_virt(FIX_BTMAP_BEGIN) >> PMD_SHIFT)
+		     != (__fix_to_virt(FIX_BTMAP_END) >> PMD_SHIFT));
+
+	if ((pmd != fixmap_pmd(fix_to_virt(FIX_BTMAP_BEGIN)))
+	     || pmd != fixmap_pmd(fix_to_virt(FIX_BTMAP_END))) {
+		WARN_ON(1);
+		pr_warn("pmd %p != %p, %p\n",
+			pmd, fixmap_pmd(fix_to_virt(FIX_BTMAP_BEGIN)),
+			fixmap_pmd(fix_to_virt(FIX_BTMAP_END)));
+		pr_warn("fix_to_virt(FIX_BTMAP_BEGIN): %08lx\n",
+			fix_to_virt(FIX_BTMAP_BEGIN));
+		pr_warn("fix_to_virt(FIX_BTMAP_END):   %08lx\n",
+			fix_to_virt(FIX_BTMAP_END));
+
+		pr_warn("FIX_BTMAP_END:       %d\n", FIX_BTMAP_END);
+		pr_warn("FIX_BTMAP_BEGIN:     %d\n", FIX_BTMAP_BEGIN);
+	}
+}
+
+void __set_fixmap(enum fixed_addresses idx,
+			       phys_addr_t phys, pgprot_t flags)
+{
+	unsigned long addr = __fix_to_virt(idx);
+	pte_t *pte;
+
+	if (idx >= __end_of_fixed_addresses) {
+		BUG();
+		return;
+	}
+
+	pte = fixmap_pte(addr);
+
+	if (pgprot_val(flags)) {
+		set_pte(pte, pfn_pte(phys >> PAGE_SHIFT, flags));
+	} else {
+		pte_clear(&init_mm, addr, pte);
+		flush_tlb_kernel_range(addr, addr+PAGE_SIZE);
+	}
+}
 
 /* For compatible with Exynos */
 

@@ -25,6 +25,7 @@
 #include <linux/vmalloc.h>
 #include <linux/blkdev.h>
 #include <linux/backing-dev.h>
+#include <linux/compiler.h>
 #include <linux/mount.h>
 #include <linux/personality.h>
 #include <linux/security.h>
@@ -454,10 +455,14 @@ void vm_unmap_aliases(void)
 EXPORT_SYMBOL_GPL(vm_unmap_aliases);
 
 /*
- * Implement a stub for vmalloc_sync_all() if the architecture chose not to
- * have one.
+ * Implement a stub for vmalloc_sync_[un]mapping() if the architecture
+ * chose not to have one.
  */
-void  __attribute__((weak)) vmalloc_sync_all(void)
+void __weak vmalloc_sync_mappings(void)
+{
+}
+
+void __weak vmalloc_sync_unmappings(void)
 {
 }
 
@@ -943,7 +948,7 @@ static int validate_mmap_request(struct file *file,
 		struct address_space *mapping;
 
 		/* files must support mmap */
-		if (!file->f_op || !file->f_op->mmap)
+		if (!file->f_op->mmap)
 			return -ENODEV;
 
 		/* work out if what we've got could possibly be shared
@@ -1000,7 +1005,7 @@ static int validate_mmap_request(struct file *file,
 			    (file->f_mode & FMODE_WRITE))
 				return -EACCES;
 
-			if (locks_verify_locked(file_inode(file)))
+			if (locks_verify_locked(file))
 				return -EAGAIN;
 
 			if (!(capabilities & BDI_CAP_MAP_DIRECT))
@@ -2004,9 +2009,10 @@ int generic_file_remap_pages(struct vm_area_struct *vma, unsigned long addr,
 EXPORT_SYMBOL(generic_file_remap_pages);
 
 static int __access_remote_vm(struct task_struct *tsk, struct mm_struct *mm,
-		unsigned long addr, void *buf, int len, int write)
+		unsigned long addr, void *buf, int len, unsigned int gup_flags)
 {
 	struct vm_area_struct *vma;
+	int write = gup_flags & FOLL_WRITE;
 
 	down_read(&mm->mmap_sem);
 
@@ -2048,7 +2054,8 @@ static int __access_remote_vm(struct task_struct *tsk, struct mm_struct *mm,
 int access_remote_vm(struct mm_struct *mm, unsigned long addr,
 		void *buf, int len, int write)
 {
-	return __access_remote_vm(NULL, mm, addr, buf, len, write);
+	return __access_remote_vm(NULL, mm, addr, buf, len,
+			write ? FOLL_WRITE : 0);
 }
 
 /*
@@ -2066,7 +2073,8 @@ int access_process_vm(struct task_struct *tsk, unsigned long addr, void *buf, in
 	if (!mm)
 		return 0;
 
-	len = __access_remote_vm(tsk, mm, addr, buf, len, write);
+	len = __access_remote_vm(tsk, mm, addr, buf, len,
+			write ? FOLL_WRITE : 0);
 
 	mmput(mm);
 	return len;

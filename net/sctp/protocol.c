@@ -67,6 +67,8 @@
 #include <net/inet_common.h>
 #include <net/inet_ecn.h>
 
+#define MAX_SCTP_PORT_HASH_ENTRIES (64 * 1024)
+
 /* Global data structures. */
 struct sctp_globals sctp_globals __read_mostly;
 
@@ -153,7 +155,7 @@ static void sctp_v4_copy_addrlist(struct list_head *addrlist,
 
 	for (ifa = in_dev->ifa_list; ifa; ifa = ifa->ifa_next) {
 		/* Add the address to the local list.  */
-		addr = t_new(struct sctp_sockaddr_entry, GFP_ATOMIC);
+		addr = kzalloc(sizeof(*addr), GFP_ATOMIC);
 		if (addr) {
 			addr->a.v4.sin_family = AF_INET;
 			addr->a.v4.sin_port = 0;
@@ -261,6 +263,7 @@ static void sctp_v4_from_sk(union sctp_addr *addr, struct sock *sk)
 	addr->v4.sin_family = AF_INET;
 	addr->v4.sin_port = 0;
 	addr->v4.sin_addr.s_addr = inet_sk(sk)->inet_rcv_saddr;
+	memset(addr->v4.sin_zero, 0, sizeof(addr->v4.sin_zero));
 }
 
 /* Initialize sk->sk_rcv_saddr from sctp_addr. */
@@ -276,13 +279,19 @@ static void sctp_v4_to_sk_daddr(union sctp_addr *addr, struct sock *sk)
 }
 
 /* Initialize a sctp_addr from an address parameter. */
-static void sctp_v4_from_addr_param(union sctp_addr *addr,
+static bool sctp_v4_from_addr_param(union sctp_addr *addr,
 				    union sctp_addr_param *param,
 				    __be16 port, int iif)
 {
+	if (ntohs(param->v4.param_hdr.length) < sizeof(struct sctp_ipv4addr_param))
+		return false;
+
 	addr->v4.sin_family = AF_INET;
 	addr->v4.sin_port = port;
 	addr->v4.sin_addr.s_addr = param->v4.addr.s_addr;
+	memset(addr->v4.sin_zero, 0, sizeof(addr->v4.sin_zero));
+
+	return true;
 }
 
 /* Initialize an address parameter from a sctp_addr and return the length
@@ -307,6 +316,7 @@ static void sctp_v4_dst_saddr(union sctp_addr *saddr, struct flowi4 *fl4,
 	saddr->v4.sin_family = AF_INET;
 	saddr->v4.sin_port = port;
 	saddr->v4.sin_addr.s_addr = fl4->saddr;
+	memset(saddr->v4.sin_zero, 0, sizeof(saddr->v4.sin_zero));
 }
 
 /* Compare two addresses exactly. */
@@ -329,6 +339,7 @@ static void sctp_v4_inaddr_any(union sctp_addr *addr, __be16 port)
 	addr->v4.sin_family = AF_INET;
 	addr->v4.sin_addr.s_addr = htonl(INADDR_ANY);
 	addr->v4.sin_port = port;
+	memset(addr->v4.sin_zero, 0, sizeof(addr->v4.sin_zero));
 }
 
 /* Is this a wildcard address? */
@@ -412,7 +423,8 @@ static sctp_scope_t sctp_v4_scope(union sctp_addr *addr)
 		retval = SCTP_SCOPE_LINK;
 	} else if (ipv4_is_private_10(addr->v4.sin_addr.s_addr) ||
 		   ipv4_is_private_172(addr->v4.sin_addr.s_addr) ||
-		   ipv4_is_private_192(addr->v4.sin_addr.s_addr)) {
+		   ipv4_is_private_192(addr->v4.sin_addr.s_addr) ||
+		   ipv4_is_test_198(addr->v4.sin_addr.s_addr)) {
 		retval = SCTP_SCOPE_PRIVATE;
 	} else {
 		retval = SCTP_SCOPE_GLOBAL;
@@ -1336,6 +1348,8 @@ SCTP_STATIC __init int sctp_init(void)
 	unsigned long limit;
 	int max_share;
 	int order;
+	int num_entries;
+	int max_entry_order;
 
 	/* SCTP_DEBUG sanity check. */
 	if (!sctp_sanity_check())
@@ -1390,14 +1404,24 @@ SCTP_STATIC __init int sctp_init(void)
 
 	/* Size and allocate the association hash table.
 	 * The methodology is similar to that of the tcp hash tables.
+	 * Though not identical.  Start by getting a goal size
 	 */
 	if (totalram_pages >= (128 * 1024))
 		goal = totalram_pages >> (22 - PAGE_SHIFT);
 	else
 		goal = totalram_pages >> (24 - PAGE_SHIFT);
 
-	for (order = 0; (1UL << order) < goal; order++)
-		;
+	/* Then compute the page order for said goal */
+	order = get_order(goal);
+
+	/* Now compute the required page order for the maximum sized table we
+	 * want to create
+	 */
+	max_entry_order = get_order(MAX_SCTP_PORT_HASH_ENTRIES *
+				    sizeof(struct sctp_bind_hashbucket));
+
+	/* Limit the page order by that maximum hash table size */
+	order = min(order, max_entry_order);
 
 	do {
 		sctp_assoc_hashsize = (1UL << order) * PAGE_SIZE /
@@ -1431,20 +1455,35 @@ SCTP_STATIC __init int sctp_init(void)
 		INIT_HLIST_HEAD(&sctp_ep_hashtable[i].chain);
 	}
 
-	/* Allocate and initialize the SCTP port hash table.  */
+	/* Allocate and initialize the SCTP port hash table.
+	 * Note that order is initalized to start at the max sized
+	 * table we want to support.  If we can't get that many pages
+	 * reduce the order and try again
+	 */
 	do {
-		sctp_port_hashsize = (1UL << order) * PAGE_SIZE /
-					sizeof(struct sctp_bind_hashbucket);
-		if ((sctp_port_hashsize > (64 * 1024)) && order > 0)
-			continue;
 		sctp_port_hashtable = (struct sctp_bind_hashbucket *)
 			__get_free_pages(GFP_ATOMIC|__GFP_NOWARN, order);
 	} while (!sctp_port_hashtable && --order > 0);
+
 	if (!sctp_port_hashtable) {
 		pr_err("Failed bind hash alloc\n");
 		status = -ENOMEM;
 		goto err_bhash_alloc;
 	}
+
+	/* Now compute the number of entries that will fit in the
+	 * port hash space we allocated
+	 */
+	num_entries = (1UL << order) * PAGE_SIZE /
+		      sizeof(struct sctp_bind_hashbucket);
+
+	/* And finish by rounding it down to the nearest power of two
+	 * this wastes some memory of course, but its needed because
+	 * the hash function operates based on the assumption that
+	 * that the number of entries is a power of two
+	 */
+	sctp_port_hashsize = rounddown_pow_of_two(num_entries);
+
 	for (i = 0; i < sctp_port_hashsize; i++) {
 		spin_lock_init(&sctp_port_hashtable[i].lock);
 		INIT_HLIST_HEAD(&sctp_port_hashtable[i].chain);

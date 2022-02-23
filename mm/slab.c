@@ -3398,11 +3398,11 @@ slab_alloc_node(struct kmem_cache *cachep, gfp_t flags, int nodeid,
 	kmemleak_alloc_recursive(ptr, cachep->object_size, 1, cachep->flags,
 				 flags);
 
-	if (likely(ptr))
+	if (likely(ptr)) {
 		kmemcheck_slab_alloc(cachep, flags, ptr, cachep->object_size);
-
-	if (unlikely((flags & __GFP_ZERO) && ptr))
-		memset(ptr, 0, cachep->object_size);
+		if (unlikely(flags & __GFP_ZERO))
+			memset(ptr, 0, cachep->object_size);
+	}
 
 	return ptr;
 }
@@ -3463,11 +3463,11 @@ slab_alloc(struct kmem_cache *cachep, gfp_t flags, unsigned long caller)
 				 flags);
 	prefetchw(objp);
 
-	if (likely(objp))
+	if (likely(objp)) {
 		kmemcheck_slab_alloc(cachep, flags, objp, cachep->object_size);
-
-	if (unlikely((flags & __GFP_ZERO) && objp))
-		memset(objp, 0, cachep->object_size);
+		if (unlikely(flags & __GFP_ZERO))
+			memset(objp, 0, cachep->object_size);
+	}
 
 	return objp;
 }
@@ -4482,6 +4482,36 @@ static int __init slab_proc_init(void)
 }
 module_init(slab_proc_init);
 #endif
+
+#ifdef CONFIG_HARDENED_USERCOPY
+/*
+ * Rejects objects that are incorrectly sized.
+ *
+ * Returns NULL if check passes, otherwise const char * to name of cache
+ * to indicate an error.
+ */
+const char *__check_heap_object(const void *ptr, unsigned long n,
+				struct page *page)
+{
+	struct kmem_cache *cachep;
+	unsigned int objnr;
+	unsigned long offset;
+
+	/* Find and validate object. */
+	cachep = page->slab_cache;
+	objnr = obj_to_index(cachep, page, (void *)ptr);
+	BUG_ON(objnr >= cachep->num);
+
+	/* Find offset within object. */
+	offset = ptr - index_to_obj(cachep, page, objnr) - obj_offset(cachep);
+
+	/* Allow address range falling entirely within object size. */
+	if (offset <= cachep->object_size && n <= cachep->object_size - offset)
+		return NULL;
+
+	return cachep->name;
+}
+#endif /* CONFIG_HARDENED_USERCOPY */
 
 /**
  * ksize - get the actual amount of memory allocated for a given object

@@ -41,8 +41,8 @@ const struct cred *override_fsids(struct sdcardfs_sb_info *sbi,
 	} else {
 		uid = sbi->options.fs_low_uid;
 	}
-	cred->fsuid = uid;
-	cred->fsgid = sbi->options.fs_low_gid;
+	cred->fsuid = make_kuid(&init_user_ns, uid);
+	cred->fsgid = make_kgid(&init_user_ns, sbi->options.fs_low_gid);
 
 	old_cred = override_creds(cred);
 
@@ -61,7 +61,7 @@ void revert_fsids(const struct cred *old_cred)
 static int sdcardfs_create(struct inode *dir, struct dentry *dentry,
 			 umode_t mode, bool want_excl)
 {
-	int err = 0;
+	int err;
 	struct dentry *lower_dentry;
 	struct vfsmount *lower_dentry_mnt;
 	struct dentry *lower_parent_dentry = NULL;
@@ -200,7 +200,7 @@ static int touch(char *abs_path, mode_t mode)
 
 static int sdcardfs_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
 {
-	int err = 0;
+	int err;
 	int make_nomedia_in_obb = 0;
 	struct dentry *lower_dentry;
 	struct vfsmount *lower_mnt;
@@ -258,6 +258,7 @@ static int sdcardfs_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode
 	task_lock(current);
 	current->fs = copied_fs;
 	task_unlock(current);
+
 	err = vfs_mkdir2(lower_mnt, lower_parent_dentry->d_inode, lower_dentry, mode);
 
 	if (err) {
@@ -523,17 +524,6 @@ out:
 }
 #endif
 
-#if 0
-/* this @nd *IS* still used */
-static void sdcardfs_put_link(struct dentry *dentry, struct nameidata *nd,
-			    void *cookie)
-{
-	char *buf = nd_get_link(nd);
-	if (!IS_ERR(buf))	/* free the char* */
-		kfree(buf);
-}
-#endif
-
 static int sdcardfs_permission_wrn(struct inode *inode, int mask)
 {
 	WARN_RATELIMIT(1, "sdcardfs does not support permission. Use permission2.\n");
@@ -602,7 +592,7 @@ static int sdcardfs_setattr_wrn(struct dentry *dentry, struct iattr *ia)
 
 static int sdcardfs_setattr(struct vfsmount *mnt, struct dentry *dentry, struct iattr *ia)
 {
-	int err = 0;
+	int err;
 	struct dentry *lower_dentry;
 	struct vfsmount *lower_mnt;
 	struct inode *inode;
@@ -804,13 +794,6 @@ const struct inode_operations sdcardfs_dir_iops = {
 	.setattr	= sdcardfs_setattr_wrn,
 	.setattr2	= sdcardfs_setattr,
 	.getattr	= sdcardfs_getattr,
-	/* XXX Following operations are implemented,
-	 *     but FUSE(sdcard) or FAT does not support them
-	 *     These methods are *NOT* perfectly tested.
-	.symlink	= sdcardfs_symlink,
-	.link		= sdcardfs_link,
-	.mknod		= sdcardfs_mknod,
-	 */
 };
 
 const struct inode_operations sdcardfs_main_iops = {

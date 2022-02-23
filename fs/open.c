@@ -239,7 +239,13 @@ int do_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 		return -EINVAL;
 
 	/* Return error if mode is not supported */
-	if (mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE))
+	if (mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE |
+		     FALLOC_FL_COLLAPSE_RANGE | FALLOC_FL_ZERO_RANGE))
+		return -EOPNOTSUPP;
+
+	/* Punch hole and zero range are mutually exclusive */
+	if ((mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE)) ==
+	    (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE))
 		return -EOPNOTSUPP;
 
 	/* Punch hole must have keep size set */
@@ -247,15 +253,28 @@ int do_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 	    !(mode & FALLOC_FL_KEEP_SIZE))
 		return -EOPNOTSUPP;
 
+	/* Collapse range should only be used exclusively. */
+	if ((mode & FALLOC_FL_COLLAPSE_RANGE) &&
+	    (mode & ~FALLOC_FL_COLLAPSE_RANGE))
+		return -EINVAL;
+
 	if (!(file->f_mode & FMODE_WRITE))
 		return -EBADF;
 
-	/* It's not possible punch hole on append only file */
-	if (mode & FALLOC_FL_PUNCH_HOLE && IS_APPEND(inode))
+	/*
+	 * We can only allow pure fallocate on append only files
+	 */
+	if ((mode & ~FALLOC_FL_KEEP_SIZE) && IS_APPEND(inode))
 		return -EPERM;
 
 	if (IS_IMMUTABLE(inode))
 		return -EPERM;
+
+	/*
+	 * We cannot allow any fallocate operation on an active swapfile
+	 */
+	if (IS_SWAPFILE(inode))
+		return -ETXTBSY;
 
 	/*
 	 * Revalidate the write permissions, in case security policy has
@@ -334,6 +353,25 @@ SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
 			override_cred->cap_effective =
 				override_cred->cap_permitted;
 	}
+
+	/*
+	 * The new set of credentials can *only* be used in
+	 * task-synchronous circumstances, and does not need
+	 * RCU freeing, unless somebody then takes a separate
+	 * reference to it.
+	 *
+	 * NOTE! This is _only_ true because this credential
+	 * is used purely for override_creds() that installs
+	 * it as the subjective cred. Other threads will be
+	 * accessing ->real_cred, not the subjective cred.
+	 *
+	 * If somebody _does_ make a copy of this (using the
+	 * 'get_current_cred()' function), that will clear the
+	 * non_rcu field, because now that other user may be
+	 * expecting RCU freeing. But normal thread-synchronous
+	 * cred accesses will keep things non-RCY.
+	 */
+	override_cred->non_rcu = 1;
 
 	old_cred = override_creds(override_cred);
 retry:
@@ -698,6 +736,10 @@ static int do_dentry_open(struct file *f,
 
 
 	f->f_op = fops_get(inode->i_fop);
+	if (unlikely(WARN_ON(!f->f_op))) {
+		error = -ENODEV;
+		goto cleanup_all;
+	}
 
 	error = security_file_open(f, cred);
 	if (error)
@@ -707,7 +749,7 @@ static int do_dentry_open(struct file *f,
 	if (error)
 		goto cleanup_all;
 
-	if (!open && f->f_op)
+	if (!open)
 		open = f->f_op->open;
 	if (open) {
 		error = open(inode, f);
@@ -825,6 +867,12 @@ static inline int build_open_flags(int flags, umode_t mode, struct open_flags *o
 {
 	int lookup_flags = 0;
 	int acc_mode;
+
+	/*
+	 * Clear out all open flags we don't know about so that we don't report
+	 * them in fcntl(F_GETFD) or similar interfaces.
+	 */
+	flags &= VALID_OPEN_FLAGS;
 
 	if (flags & (O_CREAT | __O_TMPFILE))
 		op->mode = (mode & S_IALLUGO) | S_IFREG;
@@ -1009,7 +1057,7 @@ int filp_close(struct file *filp, fl_owner_t id)
 		return 0;
 	}
 
-	if (filp->f_op && filp->f_op->flush)
+	if (filp->f_op->flush)
 		retval = filp->f_op->flush(filp, id);
 
 	if (likely(!(filp->f_mode & FMODE_PATH))) {

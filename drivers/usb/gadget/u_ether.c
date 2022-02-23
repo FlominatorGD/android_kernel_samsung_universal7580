@@ -767,11 +767,11 @@ static int alloc_tx_buffer(struct eth_dev *dev)
 
 	list_for_each(act, &dev->tx_reqs) {
 		req = container_of(act, struct usb_request, list);
-		if (!req->buf)
+		if (!req->buf) {
 			req->buf = kmalloc(dev->tx_req_bufsize,
 						GFP_ATOMIC);
-			if (!req->buf)
-				goto free_buf;
+			goto free_buf;
+		}
 	}
 	return 0;
 
@@ -816,7 +816,8 @@ static netdev_tx_t eth_start_xmit(struct sk_buff *skb,
 	spin_unlock_irqrestore(&dev->lock, flags);
 
 	if (!in) {
-		dev_kfree_skb_any(skb);
+		if (skb)
+			dev_kfree_skb_any(skb);
 		return NETDEV_TX_OK;
 	}
 

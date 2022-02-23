@@ -3,7 +3,6 @@
  *
  * Copyright (C) 1995-2009 Russell King
  * Copyright (C) 2012 ARM Ltd.
- * Copyright (c) 2014, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -49,7 +48,7 @@ static const char *handler[]= {
 	"Error"
 };
 
-int show_unhandled_signals = 1;
+int show_unhandled_signals = 0;
 
 /*
  * Dump out the contents of some memory nicely...
@@ -63,8 +62,7 @@ static void dump_mem(const char *lvl, const char *str, unsigned long bottom,
 
 	/*
 	 * We need to switch to kernel mode so that we can use __get_user
-	 * to safely read from kernel space.  Note that we now dump the
-	 * code first, just in case the backtrace kills us.
+	 * to safely read from kernel space.
 	 */
 	fs = get_fs();
 	set_fs(KERNEL_DS);
@@ -101,20 +99,11 @@ static void dump_backtrace_entry(unsigned long where, unsigned long stack)
 			 stack + sizeof(struct pt_regs));
 }
 
-static void dump_instr(const char *lvl, struct pt_regs *regs)
+static void __dump_instr(const char *lvl, struct pt_regs *regs)
 {
 	unsigned long addr = instruction_pointer(regs);
-	mm_segment_t fs;
 	char str[sizeof("00000000 ") * 5 + 2 + 1], *p = str;
 	int i;
-
-	/*
-	 * We need to switch to kernel mode so that we can use __get_user
-	 * to safely read from kernel space.  Note that we now dump the
-	 * code first, just in case the backtrace kills us.
-	 */
-	fs = get_fs();
-	set_fs(KERNEL_DS);
 
 	for (i = -4; i < 1; i++) {
 		unsigned int val, bad;
@@ -129,14 +118,23 @@ static void dump_instr(const char *lvl, struct pt_regs *regs)
 		}
 	}
 	printk("%sCode: %s\n", lvl, str);
+}
 
-	set_fs(fs);
+static void dump_instr(const char *lvl, struct pt_regs *regs)
+{
+	if (!user_mode(regs)) {
+		mm_segment_t fs = get_fs();
+		set_fs(KERNEL_DS);
+		__dump_instr(lvl, regs);
+		set_fs(fs);
+	} else {
+		__dump_instr(lvl, regs);
+	}
 }
 
 static void dump_backtrace(struct pt_regs *regs, struct task_struct *tsk)
 {
 	struct stackframe frame;
-	const register unsigned long current_sp asm ("sp");
 
 	pr_debug("%s(regs = %p tsk = %p)\n", __func__, regs, tsk);
 
@@ -149,7 +147,7 @@ static void dump_backtrace(struct pt_regs *regs, struct task_struct *tsk)
 		frame.pc = regs->pc;
 	} else if (tsk == current) {
 		frame.fp = (unsigned long)__builtin_frame_address(0);
-		frame.sp = current_sp;
+		frame.sp = current_stack_pointer;
 		frame.pc = (unsigned long)dump_backtrace;
 	} else {
 		/*
@@ -229,10 +227,12 @@ void die(const char *str, struct pt_regs *regs, int err)
 	enum bug_trap_type bug_type = BUG_TRAP_TYPE_NONE;
 	struct thread_info *thread = current_thread_info();
 	int ret;
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&die_lock, flags);
 
 	oops_enter();
 
-	raw_spin_lock_irq(&die_lock);
 	console_verbose();
 	bust_spinlocks(1);
 
@@ -248,7 +248,6 @@ void die(const char *str, struct pt_regs *regs, int err)
 
 	bust_spinlocks(0);
 	add_taint(TAINT_DIE, LOCKDEP_NOW_UNRELIABLE);
-	raw_spin_unlock_irq(&die_lock);
 	oops_exit();
 
 #if defined(CONFIG_SEC_DEBUG)
@@ -266,6 +265,9 @@ void die(const char *str, struct pt_regs *regs, int err)
 	if (panic_on_oops)
 		panic("Fatal exception");
 #endif
+
+	raw_spin_unlock_irqrestore(&die_lock, flags);
+
 	if (ret != NOTIFY_STOP)
 		do_exit(SIGSEGV);
 }
@@ -273,10 +275,13 @@ void die(const char *str, struct pt_regs *regs, int err)
 void arm64_notify_die(const char *str, struct pt_regs *regs,
 		      struct siginfo *info, int err)
 {
-	if (user_mode(regs))
+	if (user_mode(regs)) {
+		current->thread.fault_address = 0;
+		current->thread.fault_code = err;
 		force_sig_info(info->si_signo, info, current);
-	else
+	} else {
 		die(str, regs, err);
+	}
 }
 
 #ifdef CONFIG_GENERIC_BUG
@@ -287,57 +292,80 @@ int is_valid_bugaddr(unsigned long pc)
 #endif
 
 static LIST_HEAD(undef_hook);
+static DEFINE_RAW_SPINLOCK(undef_lock);
 
 void register_undef_hook(struct undef_hook *hook)
 {
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&undef_lock, flags);
 	list_add(&hook->node, &undef_hook);
+	raw_spin_unlock_irqrestore(&undef_lock, flags);
 }
 
-static int call_undef_hook(struct pt_regs *regs, unsigned int instr)
+void unregister_undef_hook(struct undef_hook *hook)
+{
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&undef_lock, flags);
+	list_del(&hook->node);
+	raw_spin_unlock_irqrestore(&undef_lock, flags);
+}
+
+static int call_undef_hook(struct pt_regs *regs)
 {
 	struct undef_hook *hook;
-	int (*fn)(struct pt_regs *regs, unsigned int instr) = NULL;
+	unsigned long flags;
+	u32 instr;
+	int (*fn)(struct pt_regs *regs, u32 instr) = NULL;
+	void __user *pc = (void __user *)instruction_pointer(regs);
 
+	if (!user_mode(regs))
+		return 1;
+
+	if (compat_thumb_mode(regs)) {
+		/* 16-bit Thumb instruction */
+		if (get_user(instr, (u16 __user *)pc))
+			goto exit;
+		instr = le16_to_cpu(instr);
+		if (aarch32_insn_is_wide(instr)) {
+			u32 instr2;
+
+			if (get_user(instr2, (u16 __user *)(pc + 2)))
+				goto exit;
+			instr2 = le16_to_cpu(instr2);
+			instr = (instr << 16) | instr2;
+		}
+	} else {
+		/* 32-bit ARM instruction */
+		if (get_user(instr, (u32 __user *)pc))
+			goto exit;
+		instr = le32_to_cpu(instr);
+	}
+
+	raw_spin_lock_irqsave(&undef_lock, flags);
 	list_for_each_entry(hook, &undef_hook, node)
 		if ((instr & hook->instr_mask) == hook->instr_val &&
-		    (regs->pstate & hook->pstate_mask) == hook->pstate_val)
+			(regs->pstate & hook->pstate_mask) == hook->pstate_val)
 			fn = hook->fn;
 
+	raw_spin_unlock_irqrestore(&undef_lock, flags);
+exit:
 	return fn ? fn(regs, instr) : 1;
 }
 
 asmlinkage void __exception do_undefinstr(struct pt_regs *regs)
 {
-	u32 instr;
 	siginfo_t info;
 	void __user *pc = (void __user *)instruction_pointer(regs);
 
 	/* check for AArch32 breakpoint instructions */
 	if (!aarch32_break_handler(regs))
 		return;
-	if (user_mode(regs)) {
-		if (compat_thumb_mode(regs)) {
-			if (get_user(instr, (u16 __user *)pc))
-				goto die_sig;
-			if (is_wide_instruction(instr)) {
-				u32 instr2;
-				if (get_user(instr2, (u16 __user *)pc+1))
-					goto die_sig;
-				instr <<= 16;
-				instr |= instr2;
-			}
-		} else if (get_user(instr, (u32 __user *)pc)) {
-			goto die_sig;
-		}
-	} else {
-		/* kernel mode */
-		instr = *((u32 *)pc);
-	}
 
-	if (call_undef_hook(regs, instr) == 0)
+	if (call_undef_hook(regs) == 0)
 		return;
 
-die_sig:
 	if (show_unhandled_signals && unhandled_signal(current, SIGILL) &&
 	    printk_ratelimit()) {
 		pr_info("%s[%d]: undefined instruction: pc=%p\n",
@@ -409,6 +437,51 @@ asmlinkage long do_ni_syscall(struct pt_regs *regs)
 	return sys_ni_syscall();
 }
 
+static const char *esr_class_str[] = {
+	[0 ... ESR_ELx_EC_MAX]		= "UNRECOGNIZED EC",
+	[ESR_ELx_EC_UNKNOWN]		= "Unknown/Uncategorized",
+	[ESR_ELx_EC_WFx]		= "WFI/WFE",
+	[ESR_ELx_EC_CP15_32]		= "CP15 MCR/MRC",
+	[ESR_ELx_EC_CP15_64]		= "CP15 MCRR/MRRC",
+	[ESR_ELx_EC_CP14_MR]		= "CP14 MCR/MRC",
+	[ESR_ELx_EC_CP14_LS]		= "CP14 LDC/STC",
+	[ESR_ELx_EC_FP_ASIMD]		= "ASIMD",
+	[ESR_ELx_EC_CP10_ID]		= "CP10 MRC/VMRS",
+	[ESR_ELx_EC_CP14_64]		= "CP14 MCRR/MRRC",
+	[ESR_ELx_EC_ILL]		= "PSTATE.IL",
+	[ESR_ELx_EC_SVC32]		= "SVC (AArch32)",
+	[ESR_ELx_EC_HVC32]		= "HVC (AArch32)",
+	[ESR_ELx_EC_SMC32]		= "SMC (AArch32)",
+	[ESR_ELx_EC_SVC64]		= "SVC (AArch64)",
+	[ESR_ELx_EC_HVC64]		= "HVC (AArch64)",
+	[ESR_ELx_EC_SMC64]		= "SMC (AArch64)",
+	[ESR_ELx_EC_SYS64]		= "MSR/MRS (AArch64)",
+	[ESR_ELx_EC_IMP_DEF]		= "EL3 IMP DEF",
+	[ESR_ELx_EC_IABT_LOW]		= "IABT (lower EL)",
+	[ESR_ELx_EC_IABT_CUR]		= "IABT (current EL)",
+	[ESR_ELx_EC_PC_ALIGN]		= "PC Alignment",
+	[ESR_ELx_EC_DABT_LOW]		= "DABT (lower EL)",
+	[ESR_ELx_EC_DABT_CUR]		= "DABT (current EL)",
+	[ESR_ELx_EC_SP_ALIGN]		= "SP Alignment",
+	[ESR_ELx_EC_FP_EXC32]		= "FP (AArch32)",
+	[ESR_ELx_EC_FP_EXC64]		= "FP (AArch64)",
+	[ESR_ELx_EC_SERROR]		= "SError",
+	[ESR_ELx_EC_BREAKPT_LOW]	= "Breakpoint (lower EL)",
+	[ESR_ELx_EC_BREAKPT_CUR]	= "Breakpoint (current EL)",
+	[ESR_ELx_EC_SOFTSTP_LOW]	= "Software Step (lower EL)",
+	[ESR_ELx_EC_SOFTSTP_CUR]	= "Software Step (current EL)",
+	[ESR_ELx_EC_WATCHPT_LOW]	= "Watchpoint (lower EL)",
+	[ESR_ELx_EC_WATCHPT_CUR]	= "Watchpoint (current EL)",
+	[ESR_ELx_EC_BKPT32]		= "BKPT (AArch32)",
+	[ESR_ELx_EC_VECTOR32]		= "Vector catch (AArch32)",
+	[ESR_ELx_EC_BRK64]		= "BRK (AArch64)",
+};
+
+const char *esr_get_class_string(u32 esr)
+{
+	return esr_class_str[ESR_ELx_EC(esr)];
+}
+
 /*
  * bad_mode handles the impossible case in the exception vector. This is always
  * fatal.
@@ -420,7 +493,6 @@ asmlinkage void bad_mode(struct pt_regs *regs, int reason, unsigned int esr)
 	pr_crit("Bad mode in %s handler detected, code 0x%08x\n",
 		handler[reason], esr);
 
-	die("Oops - bad mode", regs, 0);
 	local_irq_disable();
 	panic("bad mode");
 }
@@ -435,8 +507,8 @@ asmlinkage void bad_el0_sync(struct pt_regs *regs, int reason, unsigned int esr)
 	void __user *pc = (void __user *)instruction_pointer(regs);
 	console_verbose();
 
-	pr_crit("Bad EL0 synchronous exception detected on CPU%d, code 0x%08x\n",
-		smp_processor_id(), esr);
+	pr_crit("Bad EL0 synchronous exception detected on CPU%d, code 0x%08x -- %s\n",
+		smp_processor_id(), esr, esr_get_class_string(esr));
 	__show_regs(regs);
 
 	info.si_signo = SIGILL;

@@ -919,7 +919,7 @@ static int nilfs_get_root_dentry(struct super_block *sb,
 			iput(inode);
 		}
 	} else {
-		dentry = d_obtain_alias(inode);
+		dentry = d_obtain_root(inode);
 		if (IS_ERR(dentry)) {
 			ret = PTR_ERR(dentry);
 			goto failed_dentry;
@@ -973,7 +973,7 @@ static int nilfs_attach_snapshot(struct super_block *s, __u64 cno,
 
 static int nilfs_tree_was_touched(struct dentry *root_dentry)
 {
-	return root_dentry->d_count > 1;
+	return d_count(root_dentry) > 1;
 }
 
 /**
@@ -1114,6 +1114,7 @@ static int nilfs_remount(struct super_block *sb, int *flags, char *data)
 	unsigned long old_mount_opt;
 	int err;
 
+	sync_filesystem(sb);
 	old_sb_flags = sb->s_flags;
 	old_mount_opt = nilfs->ns_mount_opt;
 

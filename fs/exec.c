@@ -68,10 +68,6 @@
 
 #include <trace/events/sched.h>
 
-#ifdef CONFIG_RKP_KDP
-#define rkp_is_nonroot(x) ((x->cred->type)>>1 & 1)
-#endif /*CONFIG_RKP_KDP*/
-
 int suid_dumpable = 0;
 
 static LIST_HEAD(formats);
@@ -110,6 +106,7 @@ static inline void put_binfmt(struct linux_binfmt * fmt)
  */
 SYSCALL_DEFINE1(uselib, const char __user *, library)
 {
+	struct linux_binfmt *fmt;
 	struct file *file;
 	struct filename *tmp = getname(library);
 	int error = PTR_ERR(tmp);
@@ -140,24 +137,21 @@ SYSCALL_DEFINE1(uselib, const char __user *, library)
 	fsnotify_open(file);
 
 	error = -ENOEXEC;
-	if(file->f_op) {
-		struct linux_binfmt * fmt;
 
-		read_lock(&binfmt_lock);
-		list_for_each_entry(fmt, &formats, lh) {
-			if (!fmt->load_shlib)
-				continue;
-			if (!try_module_get(fmt->module))
-				continue;
-			read_unlock(&binfmt_lock);
-			error = fmt->load_shlib(file);
-			read_lock(&binfmt_lock);
-			put_binfmt(fmt);
-			if (error != -ENOEXEC)
-				break;
-		}
+	read_lock(&binfmt_lock);
+	list_for_each_entry(fmt, &formats, lh) {
+		if (!fmt->load_shlib)
+			continue;
+		if (!try_module_get(fmt->module))
+			continue;
 		read_unlock(&binfmt_lock);
+		error = fmt->load_shlib(file);
+		read_lock(&binfmt_lock);
+		put_binfmt(fmt);
+		if (error != -ENOEXEC)
+			break;
 	}
+	read_unlock(&binfmt_lock);
 exit:
 	fput(file);
 out:
@@ -776,11 +770,10 @@ EXPORT_SYMBOL(setup_arg_pages);
 
 #endif /* CONFIG_MMU */
 
-struct file *open_exec(const char *name)
+static struct file *do_open_exec(struct filename *name)
 {
 	struct file *file;
 	int err;
-	struct filename tmp = { .name = name };
 	static const struct open_flags open_exec_flags = {
 		.open_flag = O_LARGEFILE | O_RDONLY | __FMODE_EXEC,
 		.acc_mode = MAY_EXEC | MAY_OPEN,
@@ -788,7 +781,7 @@ struct file *open_exec(const char *name)
 		.lookup_flags = LOOKUP_FOLLOW,
 	};
 
-	file = do_filp_open(AT_FDCWD, &tmp, &open_exec_flags);
+	file = do_filp_open(AT_FDCWD, name, &open_exec_flags);
 	if (IS_ERR(file))
 		goto out;
 
@@ -811,6 +804,12 @@ out:
 exit:
 	fput(file);
 	return ERR_PTR(err);
+}
+
+struct file *open_exec(const char *name)
+{
+	struct filename tmp = { .name = name };
+	return do_open_exec(&tmp);
 }
 EXPORT_SYMBOL(open_exec);
 
@@ -848,7 +847,7 @@ static int exec_mmap(struct mm_struct *mm)
 	/* Notify parent that we're no longer interested in the old VM */
 	tsk = current;
 	old_mm = current->mm;
-	mm_release(tsk, old_mm);
+	exec_mm_release(tsk, old_mm);
 
 	if (old_mm) {
 		sync_mm_rss(old_mm);
@@ -1052,43 +1051,27 @@ killed:
 	return -EAGAIN;
 }
 
-char *get_task_comm(char *buf, struct task_struct *tsk)
+char *__get_task_comm(char *buf, size_t buf_size, struct task_struct *tsk)
 {
-	/* buf must be at least sizeof(tsk->comm) in size */
 	task_lock(tsk);
-	strncpy(buf, tsk->comm, sizeof(tsk->comm));
+	strncpy(buf, tsk->comm, buf_size);
 	task_unlock(tsk);
 	return buf;
 }
-EXPORT_SYMBOL_GPL(get_task_comm);
+EXPORT_SYMBOL_GPL(__get_task_comm);
 
 /*
  * These functions flushes out all traces of the currently running executable
  * so that a new one can be started
  */
 
-void set_task_comm(struct task_struct *tsk, char *buf)
+void set_task_comm(struct task_struct *tsk, const char *buf)
 {
 	task_lock(tsk);
 	trace_task_rename(tsk, buf);
 	strlcpy(tsk->comm, buf, sizeof(tsk->comm));
 	task_unlock(tsk);
 	perf_event_comm(tsk);
-}
-
-static void filename_to_taskname(char *tcomm, const char *fn, unsigned int len)
-{
-	int i, ch;
-
-	/* Copies the binary name from after last slash */
-	for (i = 0; (ch = *(fn++)) != '\0';) {
-		if (ch == '/')
-			i = 0; /* overwrite what we wrote */
-		else
-			if (i < len - 1)
-				tcomm[i++] = ch;
-	}
-	tcomm[i] = '\0';
 }
 
 int flush_old_exec(struct linux_binprm * bprm)
@@ -1104,8 +1087,6 @@ int flush_old_exec(struct linux_binprm * bprm)
 		goto out;
 
 	set_mm_exe_file(bprm->mm, bprm->file);
-
-	filename_to_taskname(bprm->tcomm, bprm->filename, sizeof(bprm->tcomm));
 	/*
 	 * Release all of the old mmap stuff
 	 */
@@ -1113,11 +1094,6 @@ int flush_old_exec(struct linux_binprm * bprm)
 	retval = exec_mmap(bprm->mm);
 	if (retval)
 		goto out;
-#ifdef CONFIG_RKP_KDP
-	if(rkp_cred_enable){
-		rkp_call(RKP_CMDID(0x43),(unsigned long long)current_cred(), (unsigned long long)bprm->mm->pgd,0,0,0);
-	}
-#endif /*CONFIG_RKP_KDP*/
 
 	bprm->mm = NULL;		/* We're using it now */
 
@@ -1160,7 +1136,7 @@ void setup_new_exec(struct linux_binprm * bprm)
 	else
 		set_dumpable(current->mm, suid_dumpable);
 
-	set_task_comm(current, bprm->tcomm);
+	set_task_comm(current, kbasename(bprm->filename));
 
 	/* Set the new mm task size. We have to do that late because it may
 	 * depend on TIF_32BIT which is only updated in flush_thread() on
@@ -1180,9 +1156,7 @@ void setup_new_exec(struct linux_binprm * bprm)
 
 	/* An exec changes our domain. We are no longer part of the thread
 	   group */
-
-	current->self_exec_id++;
-			
+	WRITE_ONCE(current->self_exec_id, current->self_exec_id + 1);
 	flush_signal_handlers(current, 0);
 }
 EXPORT_SYMBOL(setup_new_exec);
@@ -1206,7 +1180,7 @@ int prepare_bprm_creds(struct linux_binprm *bprm)
 	return -ENOMEM;
 }
 
-void free_bprm(struct linux_binprm *bprm)
+static void free_bprm(struct linux_binprm *bprm)
 {
 	free_arg_pages(bprm);
 	if (bprm->cred) {
@@ -1264,14 +1238,13 @@ EXPORT_SYMBOL(install_exec_creds);
  * - the caller must hold ->cred_guard_mutex to protect against
  *   PTRACE_ATTACH or seccomp thread-sync
  */
-static int check_unsafe_exec(struct linux_binprm *bprm)
+static void check_unsafe_exec(struct linux_binprm *bprm)
 {
 	struct task_struct *p = current, *t;
 	unsigned n_fs;
-	int res = 0;
 
 	if (p->ptrace) {
-		if (p->ptrace & PT_PTRACE_CAP)
+		if (ptracer_capable(p, current_user_ns()))
 			bprm->unsafe |= LSM_UNSAFE_PTRACE_CAP;
 		else
 			bprm->unsafe |= LSM_UNSAFE_PTRACE;
@@ -1293,18 +1266,11 @@ static int check_unsafe_exec(struct linux_binprm *bprm)
 	}
 	rcu_read_unlock();
 
-	if (p->fs->users > n_fs) {
+	if (p->fs->users > n_fs)
 		bprm->unsafe |= LSM_UNSAFE_SHARE;
-	} else {
-		res = -EAGAIN;
-		if (!p->fs->in_exec) {
-			p->fs->in_exec = 1;
-			res = 1;
-		}
-	}
+	else
+		p->fs->in_exec = 1;
 	spin_unlock(&p->fs->lock);
-
-	return res;
 }
 
 static void bprm_fill_uid(struct linux_binprm *bprm)
@@ -1354,8 +1320,8 @@ static void bprm_fill_uid(struct linux_binprm *bprm)
 	}
 }
 
-/* 
- * Fill the binprm structure from the inode. 
+/*
+ * Fill the binprm structure from the inode.
  * Check permissions, then read the first 128 (BINPRM_BUF_SIZE) bytes
  *
  * This may be called multiple times for binary chains (scripts for example).
@@ -1363,9 +1329,6 @@ static void bprm_fill_uid(struct linux_binprm *bprm)
 int prepare_binprm(struct linux_binprm *bprm)
 {
 	int retval;
-
-	if (bprm->file->f_op == NULL)
-		return -EACCES;
 
 	bprm_fill_uid(bprm);
 
@@ -1513,164 +1476,21 @@ int search_binary_handler(struct linux_binprm *bprm)
 
 EXPORT_SYMBOL(search_binary_handler);
 
-#if defined CONFIG_SEC_RESTRICT_FORK
-#if defined CONFIG_SEC_RESTRICT_ROOTING_LOG
-#define PRINT_LOG(...)	printk(KERN_ERR __VA_ARGS__)
-#else
-#define PRINT_LOG(...)
-#endif	// End of CONFIG_SEC_RESTRICT_ROOTING_LOG
-
-#define CHECK_ROOT_UID(x) (x->cred->uid == 0 || x->cred->gid == 0 || \
-			x->cred->euid == 0 || x->cred->egid == 0 || \
-			x->cred->suid == 0 || x->cred->sgid == 0)
-
-/*  sec_check_execpath
-    return value : give task's exec path is matched or not
-*/
-int sec_check_execpath(struct mm_struct *mm, char *denypath)
-{
-	struct file *exe_file;
-	char *path, *pathbuf = NULL;
-	unsigned int path_length = 0, denypath_length = 0;
-	int ret = 0;
-
-	if (mm == NULL)
-		return 0;
-
-	if (!(exe_file = get_mm_exe_file(mm))) {
-		PRINT_LOG("Cannot get exe from task->mm.\n");
-		goto out_nofile;
-	}
-
-	if (!(pathbuf = kmalloc(PATH_MAX, GFP_TEMPORARY))) {
-		PRINT_LOG("failed to kmalloc for pathbuf\n");
-		goto out;
-	}
-
-	path = d_path(&exe_file->f_path, pathbuf, PATH_MAX);
-	if (IS_ERR(path)) {
-		PRINT_LOG("Error get path..\n");
-		goto out;
-	}
-
-	path_length = strlen(path);
-	denypath_length = strlen(denypath);
-
-	if (!strncmp(path, denypath, (path_length < denypath_length) ?
-				path_length : denypath_length)) {
-		ret = 1;
-	}
-out:
-	fput(exe_file);
-out_nofile:
-	if (pathbuf)
-		kfree(pathbuf);
-
-	return ret;
-}
-EXPORT_SYMBOL(sec_check_execpath);
-
-#ifdef CONFIG_RKP_KDP
-static int rkp_restrict_fork(void)
-{
-	struct cred *shellcred;
-
-	if(rkp_is_nonroot(current)){
-		shellcred = prepare_creds();
-		if (!shellcred) {
-			return 1;
-		}
-		shellcred->uid = 2000;
-		shellcred->gid = 2000;
-		shellcred->euid = 2000;
-		shellcred->egid = 2000;
-		commit_creds(shellcred);
-	}
-	return 0;
-}
-#endif /*CONFIG_RKP_KDP*/
-static int sec_restrict_fork(void)
-{
-	struct cred *shellcred;
-	int ret = 0;
-	struct task_struct *parent_tsk;
-	struct mm_struct *parent_mm = NULL;
-	const struct cred *parent_cred;
-
-	read_lock(&tasklist_lock);
-	parent_tsk = current->parent;
-	if (!parent_tsk) {
-		read_unlock(&tasklist_lock);
-		return 0;
-	}
-
-	get_task_struct(parent_tsk);
-	/* holding on to the task struct is enough so just release
-	 * the tasklist lock here */
-	read_unlock(&tasklist_lock);
-
-	if (current->pid == 1 || parent_tsk->pid == 1)
-		goto out;
-
-	/* get current->parent's mm struct to access it's mm
-	 * and to keep it alive */
-	parent_mm = get_task_mm(parent_tsk);
-
-	if (current->mm == NULL || parent_mm == NULL)
-		goto out;
-
-	if (sec_check_execpath(parent_mm, "/sbin/adbd")) {
-		shellcred = prepare_creds();
-		if (!shellcred) {
-			ret = 1;
-			goto out;
-		}
-
-		shellcred->uid = 2000;
-		shellcred->gid = 2000;
-		shellcred->euid = 2000;
-		shellcred->egid = 2000;
-		commit_creds(shellcred);
-		ret = 0;
-		goto out;
-	}
-
-	if (sec_check_execpath(current->mm, "/data/")) {
-		ret = 1;
-		goto out;
-	}
-
-	parent_cred = get_task_cred(parent_tsk);
-	if (!parent_cred)
-		goto out;
-	if (!CHECK_ROOT_UID(parent_tsk))
-	{
-		ret = 1;
-	}
-	put_cred(parent_cred);
-out:
-	if (parent_mm)
-		mmput(parent_mm);
-	put_task_struct(parent_tsk);
-
-	return ret;
-}
-#endif	/* End of CONFIG_SEC_RESTRICT_FORK */
-
 /*
  * sys_execve() executes a new program.
  */
-static int do_execve_common(const char *filename,
+static int do_execve_common(struct filename *filename,
 				struct user_arg_ptr argv,
 				struct user_arg_ptr envp)
 {
 	struct linux_binprm *bprm;
 	struct file *file;
 	struct files_struct *displaced;
-	bool clear_in_exec;
 	int retval;
 	const struct cred *cred = current_cred();
-	bool is_su;
+
+	if (IS_ERR(filename))
+		return PTR_ERR(filename);
 
 	/*
 	 * We move the actual failure in case of RLIMIT_NPROC excess from
@@ -1701,13 +1521,10 @@ static int do_execve_common(const char *filename,
 	if (retval)
 		goto out_free;
 
-	retval = check_unsafe_exec(bprm);
-	if (retval < 0)
-		goto out_free;
-	clear_in_exec = retval;
+	check_unsafe_exec(bprm);
 	current->in_execve = 1;
 
-	file = open_exec(filename);
+	file = do_open_exec(filename);
 	retval = PTR_ERR(file);
 	if (IS_ERR(file))
 		goto out_unmark;
@@ -1715,8 +1532,7 @@ static int do_execve_common(const char *filename,
 	sched_exec();
 
 	bprm->file = file;
-	bprm->filename = filename;
-	bprm->interp = filename;
+	bprm->filename = bprm->interp = filename->name;
 
 	retval = bprm_mm_init(bprm);
 	if (retval)
@@ -1747,23 +1563,16 @@ static int do_execve_common(const char *filename,
 	if (retval < 0)
 		goto out;
 
-	/* search_binary_handler can release file and it may be freed */
-	is_su = d_is_su(file->f_dentry);
-
 	retval = search_binary_handler(bprm);
 	if (retval < 0)
 		goto out;
-
-	if (is_su && capable(CAP_SYS_ADMIN)) {
-		current->flags |= PF_SU;
-		su_exec();
-	}
 
 	/* execve succeeded */
 	current->fs->in_exec = 0;
 	current->in_execve = 0;
 	acct_update_integrals(current);
 	free_bprm(bprm);
+	putname(filename);
 	if (displaced)
 		put_files_struct(displaced);
 	return retval;
@@ -1781,8 +1590,7 @@ out_file:
 	}
 
 out_unmark:
-	if (clear_in_exec)
-		current->fs->in_exec = 0;
+	current->fs->in_exec = 0;
 	current->in_execve = 0;
 
 out_free:
@@ -1792,10 +1600,11 @@ out_files:
 	if (displaced)
 		reset_files_struct(displaced);
 out_ret:
+	putname(filename);
 	return retval;
 }
 
-int do_execve(const char *filename,
+int do_execve(struct filename *filename,
 	const char __user *const __user *__argv,
 	const char __user *const __user *__envp)
 {
@@ -1805,7 +1614,7 @@ int do_execve(const char *filename,
 }
 
 #ifdef CONFIG_COMPAT
-static int compat_do_execve(const char *filename,
+static int compat_do_execve(struct filename *filename,
 	const compat_uptr_t __user *__argv,
 	const compat_uptr_t __user *__envp)
 {
@@ -1900,52 +1709,13 @@ SYSCALL_DEFINE3(execve,
 		const char __user *const __user *, argv,
 		const char __user *const __user *, envp)
 {
-	struct filename *path = getname(filename);
-	int error = PTR_ERR(path);
-	if (!IS_ERR(path)) {
-#ifdef CONFIG_RKP_KDP
-		if(rkp_cred_enable){
-			rkp_call(RKP_CMDID(0x4b),(u64)path->name,0,0,0,0);
-		}
-#endif
-#if defined CONFIG_SEC_RESTRICT_FORK
-		if(CHECK_ROOT_UID(current)){
-			if(sec_restrict_fork()){
-				PRINT_LOG("Restricted making process. PID = %d(%s) "
-								"PPID = %d(%s)\n",
-				current->pid, current->comm,
-				current->parent->pid, current->parent->comm);
-				return -EACCES;
-			}
-		}
-#ifdef CONFIG_RKP_KDP
-		if(CHECK_ROOT_UID(current) && rkp_cred_enable) {
-			if(rkp_restrict_fork()){
-				PRINT_LOG("RKP_KDP Restricted making process. PID = %d(%s) "
-								"PPID = %d(%s)\n",
-				current->pid, current->comm,
-				current->parent->pid, current->parent->comm);
-				return -EACCES;
-			}
-		}
-#endif
-#endif	// End of CONFIG_SEC_RESTRICT_FORK
-		error = do_execve(path->name, argv, envp);
-		putname(path);
-	}
-	return error;
+	return do_execve(getname(filename), argv, envp);
 }
 #ifdef CONFIG_COMPAT
-asmlinkage long compat_sys_execve(const char __user * filename,
-	const compat_uptr_t __user * argv,
-	const compat_uptr_t __user * envp)
+COMPAT_SYSCALL_DEFINE3(execve, const char __user *, filename,
+	const compat_uptr_t __user *, argv,
+	const compat_uptr_t __user *, envp)
 {
-	struct filename *path = getname(filename);
-	int error = PTR_ERR(path);
-	if (!IS_ERR(path)) {
-		error = compat_do_execve(path->name, argv, envp);
-		putname(path);
-	}
-	return error;
+	return compat_do_execve(getname(filename), argv, envp);
 }
 #endif

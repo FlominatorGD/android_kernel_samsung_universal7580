@@ -14,7 +14,6 @@
 #include <linux/types.h>
 #include <linux/kernel.h>
 #include <linux/skbuff.h>
-#include <linux/reciprocal_div.h>
 #include <linux/vmalloc.h>
 #include <net/pkt_sched.h>
 #include <net/inet_ecn.h>
@@ -76,12 +75,6 @@ struct choke_sched_data {
 
 	struct sk_buff **tab;
 };
-
-/* deliver a random number between 0 and N - 1 */
-static u32 random_N(unsigned int N)
-{
-	return reciprocal_divide(prandom_u32(), N);
-}
 
 /* number of elements in queue including holes */
 static unsigned int choke_len(const struct choke_sched_data *q)
@@ -233,7 +226,7 @@ static struct sk_buff *choke_peek_random(const struct choke_sched_data *q,
 	int retrys = 3;
 
 	do {
-		*pidx = (q->head + random_N(choke_len(q))) & q->tab_mask;
+		*pidx = (q->head + prandom_u32_max(choke_len(q))) & q->tab_mask;
 		skb = q->tab[*pidx];
 		if (skb)
 			return skb;
@@ -415,6 +408,7 @@ static int choke_change(struct Qdisc *sch, struct nlattr *opt)
 	struct sk_buff **old = NULL;
 	unsigned int mask;
 	u32 max_P;
+	u8 *stab;
 
 	if (opt == NULL)
 		return -EINVAL;
@@ -430,6 +424,9 @@ static int choke_change(struct Qdisc *sch, struct nlattr *opt)
 	max_P = tb[TCA_CHOKE_MAX_P] ? nla_get_u32(tb[TCA_CHOKE_MAX_P]) : 0;
 
 	ctl = nla_data(tb[TCA_CHOKE_PARMS]);
+	stab = nla_data(tb[TCA_CHOKE_STAB]);
+	if (!red_check_params(ctl->qth_min, ctl->qth_max, ctl->Wlog, ctl->Scell_log, stab))
+		return -EINVAL;
 
 	if (ctl->limit > CHOKE_MAX_QUEUE)
 		return -EINVAL;
@@ -438,7 +435,8 @@ static int choke_change(struct Qdisc *sch, struct nlattr *opt)
 	if (mask != q->tab_mask) {
 		struct sk_buff **ntab;
 
-		ntab = kcalloc(mask + 1, sizeof(struct sk_buff *), GFP_KERNEL);
+		ntab = kcalloc(mask + 1, sizeof(struct sk_buff *),
+			       GFP_KERNEL | __GFP_NOWARN);
 		if (!ntab)
 			ntab = vzalloc((mask + 1) * sizeof(struct sk_buff *));
 		if (!ntab)
@@ -478,7 +476,7 @@ static int choke_change(struct Qdisc *sch, struct nlattr *opt)
 
 	red_set_parms(&q->parms, ctl->qth_min, ctl->qth_max, ctl->Wlog,
 		      ctl->Plog, ctl->Scell_log,
-		      nla_data(tb[TCA_CHOKE_STAB]),
+		      stab,
 		      max_P);
 	red_set_vars(&q->vars);
 

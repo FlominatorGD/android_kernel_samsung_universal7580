@@ -47,6 +47,7 @@
 #include <linux/notifier.h>
 #include <linux/exynos-ss.h>
 
+#include <asm/alternative.h>
 #include <asm/compat.h>
 #include <asm/cacheflush.h>
 #include <asm/fpsimd.h>
@@ -54,36 +55,16 @@
 #include <asm/processor.h>
 #include <asm/stacktrace.h>
 
-static void setup_restart(void)
-{
-	/*
-	 * Tell the mm system that we are going to reboot -
-	 * we may need it to insert some 1:1 mappings so that
-	 * soft boot works.
-	 */
-	setup_mm_for_reboot();
-
-	/* Clean and invalidate caches */
-	flush_cache_all();
-
-	/* Turn D-cache off */
-	cpu_cache_off();
-
-	/* Push out any further dirty data, and ensure cache is empty */
-	flush_cache_all();
-}
+#ifdef CONFIG_CC_STACKPROTECTOR
+#include <linux/stackprotector.h>
+unsigned long __stack_chk_guard __read_mostly;
+EXPORT_SYMBOL(__stack_chk_guard);
+#endif
 
 void soft_restart(unsigned long addr)
 {
-	typedef void (*phys_reset_t)(unsigned long);
-	phys_reset_t phys_reset;
-
-	setup_restart();
-
-	/* Switch to the identity mapping */
-	phys_reset = (phys_reset_t)virt_to_phys(cpu_reset);
-	phys_reset(addr);
-
+	setup_mm_for_reboot();
+	cpu_soft_restart(virt_to_phys(cpu_reset), addr);
 	/* Should never get here */
 	BUG();
 }
@@ -282,15 +263,6 @@ void __show_regs(struct pt_regs *regs)
 		top_reg = 29;
 
 	}
-	if (!user_mode(regs)) {
-		exynos_ss_save_context(regs);
-		/*
-		 *  If you want to see more kernel events after panic,
-		 *  you should modify exynos_ss_set_enable's function 2nd parameter
-		 *  to true.
-		 */
-		exynos_ss_set_enable("log_kevents", false);
-	}
 
 	show_regs_print_info(KERN_DEFAULT);
 	print_symbol("PC is at %s\n", instruction_pointer(regs));
@@ -352,7 +324,8 @@ void release_thread(struct task_struct *dead_task)
 
 int arch_dup_task_struct(struct task_struct *dst, struct task_struct *src)
 {
-	fpsimd_save_state(&current->thread.fpsimd_state);
+	if (current->mm)
+		fpsimd_preserve_current_state();
 	*dst = *src;
 	return 0;
 }
@@ -366,6 +339,15 @@ int copy_thread(unsigned long clone_flags, unsigned long stack_start,
 	unsigned long tls = p->thread.tp_value;
 
 	memset(&p->thread.cpu_context, 0, sizeof(struct cpu_context));
+
+	/*
+	 * In case p was allocated the same task_struct pointer as some
+	 * other recently-exited task, make sure p is disassociated from
+	 * any cpu that may have run that now-exited task recently.
+	 * Otherwise we could erroneously skip reloading the FPSIMD
+	 * registers for p.
+	 */
+	fpsimd_flush_task_state(p);
 
 	if (likely(!(p->flags & PF_KTHREAD))) {
 		*childregs = *current_pt_regs();
@@ -395,6 +377,9 @@ int copy_thread(unsigned long clone_flags, unsigned long stack_start,
 	} else {
 		memset(childregs, 0, sizeof(struct pt_regs));
 		childregs->pstate = PSR_MODE_EL1h;
+		if (IS_ENABLED(CONFIG_ARM64_UAO) &&
+		    cpus_have_cap(ARM64_HAS_UAO))
+			childregs->pstate |= PSR_UAO_BIT;
 		p->thread.cpu_context.x19 = stack_start;
 		p->thread.cpu_context.x20 = stk_sz;
 	}
@@ -430,6 +415,17 @@ static void tls_thread_switch(struct task_struct *next)
 	: : "r" (tpidr), "r" (tpidrro));
 }
 
+/* Restore the UAO state depending on next's addr_limit */
+static void uao_thread_switch(struct task_struct *next)
+{
+	if (IS_ENABLED(CONFIG_ARM64_UAO)) {
+		if (task_thread_info(next)->addr_limit == KERNEL_DS)
+			asm(ALTERNATIVE("nop", SET_PSTATE_UAO(1), ARM64_HAS_UAO));
+		else
+			asm(ALTERNATIVE("nop", SET_PSTATE_UAO(0), ARM64_HAS_UAO));
+	}
+}
+
 /*
  * Thread switching.
  */
@@ -442,6 +438,7 @@ struct task_struct *__switch_to(struct task_struct *prev,
 	tls_thread_switch(next);
 	hw_breakpoint_thread_switch(next);
 	contextidr_thread_switch(next);
+	uao_thread_switch(next);
 
 	/*
 	 * Complete any pending TLB or cache maintenance on this CPU in case
@@ -494,9 +491,4 @@ static unsigned long randomize_base(unsigned long base)
 unsigned long arch_randomize_brk(struct mm_struct *mm)
 {
 	return randomize_base(mm->brk);
-}
-
-unsigned long randomize_et_dyn(unsigned long base)
-{
-	return randomize_base(base);
 }

@@ -69,6 +69,21 @@ ENTRY(cpu_reset)
 	ret	x0
 ENDPROC(cpu_reset)
 
+ENTRY(cpu_soft_restart)
+	/* Save address of cpu_reset() and reset address */
+	mov	x19, x0
+	mov	x20, x1
+
+	/* Turn D-cache off */
+	bl	cpu_cache_off
+
+	/* Push out all dirty data, and ensure cache is empty */
+	bl	flush_cache_all
+
+	mov	x0, x20
+	ret	x19
+ENDPROC(cpu_soft_restart)
+
 /*
  *	cpu_do_idle()
  *
@@ -142,6 +157,7 @@ ENTRY(cpu_do_resume)
 	 */
 	ubfx	x11, x11, #1, #1
 	msr	oslar_el1, x11
+	reset_pmuserenr_el0 x0			// Disable PMU access from EL0
 	mov	x0, x12
 	dsb	nsh		// Make sure local tlb invalidation completed
 	isb
@@ -173,13 +189,15 @@ ENDPROC(cpu_do_switch_mm)
  *	value of the SCTLR_EL1 register.
  */
 ENTRY(__cpu_setup)
-	ic	iallu				// I+BTB cache invalidate
 	tlbi	vmalle1is			// invalidate I + D TLBs
-	dsb	sy
+	dsb	ish
 
 	mov	x0, #3 << 20
 	msr	cpacr_el1, x0			// Enable FP/ASIMD
 	msr	mdscr_el1, xzr			// Reset mdscr_el1
+	isb					// Unmask debug exceptions now,
+	enable_dbg				// since this is per-cpu
+	reset_pmuserenr_el0 x0			// Disable PMU access from EL0
 	/*
 	 * Memory region attributes for LPAE:
 	 *
@@ -219,20 +237,6 @@ ENTRY(__cpu_setup)
 	ret					// return to head.S
 ENDPROC(__cpu_setup)
 
-#ifdef CONFIG_ARMV7_COMPAT
-	/*
-	 *                 n n            T
-	 *       U E      WT T UD     US IHBS
-	 *       CE0      XWHW CZ     ME TEEA S
-	 * .... .IEE .... NEAI TE.I ..AD DEN0 ACAM
-	 * 0011 0... 1101 ..0. ..0. 10.. .... .... < hardware reserved
-	 * .... .100 .... 01.1 11.1 ..01 0011 1101 < software settings
-	 */
-	.type	crval, #object
-crval:
-	.word	0x030802e2			// clear
-	.word	0x0405d03d			// set
-#else
 	/*
 	 *                 n n            T
 	 *       U E      WT T UD     US IHBS
@@ -245,4 +249,3 @@ crval:
 crval:
 	.word	0x000802e2			// clear
 	.word	0x0405d11d			// set
-#endif

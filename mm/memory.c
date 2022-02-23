@@ -131,7 +131,7 @@ static int __init init_zero_pfn(void)
 	zero_pfn = page_to_pfn(ZERO_PAGE(0));
 	return 0;
 }
-core_initcall(init_zero_pfn);
+early_initcall(init_zero_pfn);
 
 
 #if defined(SPLIT_RSS_COUNTING)
@@ -712,7 +712,7 @@ static void print_bad_pte(struct vm_area_struct *vma, unsigned long addr,
 	if (vma->vm_ops)
 		printk(KERN_ALERT "vma->vm_ops->fault: %pSR\n",
 		       vma->vm_ops->fault);
-	if (vma->vm_file && vma->vm_file->f_op)
+	if (vma->vm_file)
 		printk(KERN_ALERT "vma->vm_file->f_op->mmap: %pSR\n",
 		       vma->vm_file->f_op->mmap);
 	dump_stack();
@@ -1680,6 +1680,10 @@ split_fallthrough:
 			update_mmu_cache(vma, address, ptep);
 			pte = *ptep;
 			set_pte_at_notify(mm, address, ptep, pte);
+			if (!pte_present(pte)) {
+				pte_unmap_unlock(ptep, ptl);
+				goto split_fallthrough;
+			}
 			page = vm_normal_page(vma, address, pte);
 			BUG_ON(!page);
 
@@ -2341,10 +2345,14 @@ EXPORT_SYMBOL(vm_insert_pfn);
 int vm_insert_mixed(struct vm_area_struct *vma, unsigned long addr,
 			unsigned long pfn)
 {
+	pgprot_t pgprot = vma->vm_page_prot;
+
 	BUG_ON(!(vma->vm_flags & VM_MIXEDMAP));
 
 	if (addr < vma->vm_start || addr >= vma->vm_end)
 		return -EFAULT;
+	if (track_pfn_insert(vma, &pgprot, pfn))
+		return -EINVAL;
 
 	/*
 	 * If we don't have pte special, then we have to use the pfn_valid()
@@ -2357,9 +2365,9 @@ int vm_insert_mixed(struct vm_area_struct *vma, unsigned long addr,
 		struct page *page;
 
 		page = pfn_to_page(pfn);
-		return insert_page(vma, addr, page, vma->vm_page_prot);
+		return insert_page(vma, addr, page, pgprot);
 	}
-	return insert_pfn(vma, addr, pfn, vma->vm_page_prot);
+	return insert_pfn(vma, addr, pfn, pgprot);
 }
 EXPORT_SYMBOL(vm_insert_mixed);
 
@@ -4192,10 +4200,11 @@ EXPORT_SYMBOL_GPL(generic_access_phys);
  * given task for page fault accounting.
  */
 static int __access_remote_vm(struct task_struct *tsk, struct mm_struct *mm,
-		unsigned long addr, void *buf, int len, int write)
+		unsigned long addr, void *buf, int len, unsigned int gup_flags)
 {
 	struct vm_area_struct *vma;
 	void *old_buf = buf;
+	int write = gup_flags & FOLL_WRITE;
 
 	down_read(&mm->mmap_sem);
 	/* ignore errors, just check how much was successfully transferred */
@@ -4205,7 +4214,7 @@ static int __access_remote_vm(struct task_struct *tsk, struct mm_struct *mm,
 		struct page *page = NULL;
 
 		ret = get_user_pages(tsk, mm, addr, 1,
-				write, 1, &page, &vma);
+				gup_flags, 1, &page, &vma);
 		if (ret <= 0) {
 			/*
 			 * Check if this is a VM_IO | VM_PFNMAP VMA, which
@@ -4262,7 +4271,12 @@ static int __access_remote_vm(struct task_struct *tsk, struct mm_struct *mm,
 int access_remote_vm(struct mm_struct *mm, unsigned long addr,
 		void *buf, int len, int write)
 {
-	return __access_remote_vm(NULL, mm, addr, buf, len, write);
+	unsigned int flags = FOLL_FORCE;
+
+	if (write)
+		flags |= FOLL_WRITE;
+
+	return __access_remote_vm(NULL, mm, addr, buf, len, flags);
 }
 
 /*
@@ -4275,12 +4289,17 @@ int access_process_vm(struct task_struct *tsk, unsigned long addr,
 {
 	struct mm_struct *mm;
 	int ret;
+	unsigned int flags = FOLL_FORCE;
 
 	mm = get_task_mm(tsk);
 	if (!mm)
 		return 0;
 
-	ret = __access_remote_vm(tsk, mm, addr, buf, len, write);
+	if (write)
+		flags |= FOLL_WRITE;
+
+	ret = __access_remote_vm(tsk, mm, addr, buf, len, flags);
+
 	mmput(mm);
 
 	return ret;

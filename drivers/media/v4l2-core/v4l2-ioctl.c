@@ -2251,7 +2251,7 @@ done:
 }
 
 static int check_array_args(unsigned int cmd, void *parg, size_t *array_size,
-			    void * __user *user_ptr, void ***kernel_ptr)
+			    void __user **user_ptr, void ***kernel_ptr)
 {
 	int ret = 0;
 
@@ -2268,7 +2268,7 @@ static int check_array_args(unsigned int cmd, void *parg, size_t *array_size,
 				break;
 			}
 			*user_ptr = (void __user *)buf->m.planes;
-			*kernel_ptr = (void *)&buf->m.planes;
+			*kernel_ptr = (void **)&buf->m.planes;
 			*array_size = sizeof(struct v4l2_plane) * buf->length;
 			ret = 1;
 		}
@@ -2285,7 +2285,7 @@ static int check_array_args(unsigned int cmd, void *parg, size_t *array_size,
 				break;
 			}
 			*user_ptr = (void __user *)edid->edid;
-			*kernel_ptr = (void *)&edid->edid;
+			*kernel_ptr = (void **)&edid->edid;
 			*array_size = edid->blocks * 128;
 			ret = 1;
 		}
@@ -2303,7 +2303,7 @@ static int check_array_args(unsigned int cmd, void *parg, size_t *array_size,
 				break;
 			}
 			*user_ptr = (void __user *)ctrls->controls;
-			*kernel_ptr = (void *)&ctrls->controls;
+			*kernel_ptr = (void **)&ctrls->controls;
 			*array_size = sizeof(struct v4l2_ext_control)
 				    * ctrls->count;
 			ret = 1;
@@ -2320,7 +2320,7 @@ video_usercopy(struct file *file, unsigned int cmd, unsigned long arg,
 	       v4l2_kioctl func)
 {
 	char	sbuf[128];
-	void    *mbuf = NULL;
+	void    *mbuf = NULL, *array_buf = NULL;
 	void	*parg = (void *)arg;
 	long	err  = -EINVAL;
 	bool	has_array_args;
@@ -2375,20 +2375,14 @@ video_usercopy(struct file *file, unsigned int cmd, unsigned long arg,
 	has_array_args = err;
 
 	if (has_array_args) {
-		/*
-		 * When adding new types of array args, make sure that the
-		 * parent argument to ioctl (which contains the pointer to the
-		 * array) fits into sbuf (so that mbuf will still remain
-		 * unused up to here).
-		 */
-		mbuf = kmalloc(array_size, GFP_KERNEL);
+		array_buf = kmalloc(array_size, GFP_KERNEL);
 		err = -ENOMEM;
-		if (NULL == mbuf)
+		if (array_buf == NULL)
 			goto out_array_args;
 		err = -EFAULT;
-		if (copy_from_user(mbuf, user_ptr, array_size))
+		if (copy_from_user(array_buf, user_ptr, array_size))
 			goto out_array_args;
-		*kernel_ptr = mbuf;
+		*kernel_ptr = array_buf;
 	}
 
 	/* Handles IOCTL */
@@ -2397,8 +2391,8 @@ video_usercopy(struct file *file, unsigned int cmd, unsigned long arg,
 		err = -ENOTTY;
 
 	if (has_array_args) {
-		*kernel_ptr = user_ptr;
-		if (copy_to_user(user_ptr, mbuf, array_size))
+		*kernel_ptr = (void __force *)user_ptr;
+		if (copy_to_user(user_ptr, array_buf, array_size))
 			err = -EFAULT;
 		goto out_array_args;
 	}
@@ -2418,6 +2412,7 @@ out_array_args:
 	}
 
 out:
+	kfree(array_buf);
 	kfree(mbuf);
 	return err;
 }

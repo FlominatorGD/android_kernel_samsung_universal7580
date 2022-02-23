@@ -108,6 +108,7 @@ static int sctp_inet6addr_event(struct notifier_block *this, unsigned long ev,
 		if (addr) {
 			addr->a.v6.sin6_family = AF_INET6;
 			addr->a.v6.sin6_port = 0;
+			addr->a.v6.sin6_flowinfo = 0;
 			addr->a.v6.sin6_addr = ifa->addr;
 			addr->a.v6.sin6_scope_id = ifa->idev->dev->ifindex;
 			addr->valid = 1;
@@ -386,7 +387,7 @@ static void sctp_v6_copy_addrlist(struct list_head *addrlist,
 	read_lock_bh(&in6_dev->lock);
 	list_for_each_entry(ifp, &in6_dev->addr_list, if_list) {
 		/* Add the address to the local list.  */
-		addr = t_new(struct sctp_sockaddr_entry, GFP_ATOMIC);
+		addr = kzalloc(sizeof(*addr), GFP_ATOMIC);
 		if (addr) {
 			addr->a.v6.sin6_family = AF_INET6;
 			addr->a.v6.sin6_port = 0;
@@ -403,7 +404,7 @@ static void sctp_v6_copy_addrlist(struct list_head *addrlist,
 }
 
 /* Initialize a sockaddr_storage from in incoming skb. */
-static void sctp_v6_from_skb(union sctp_addr *addr,struct sk_buff *skb,
+static void sctp_v6_from_skb(union sctp_addr *addr, struct sk_buff *skb,
 			     int is_saddr)
 {
 	__be16 *port;
@@ -460,15 +461,20 @@ static void sctp_v6_to_sk_daddr(union sctp_addr *addr, struct sock *sk)
 }
 
 /* Initialize a sctp_addr from an address parameter. */
-static void sctp_v6_from_addr_param(union sctp_addr *addr,
+static bool sctp_v6_from_addr_param(union sctp_addr *addr,
 				    union sctp_addr_param *param,
 				    __be16 port, int iif)
 {
+	if (ntohs(param->v6.param_hdr.length) < sizeof(struct sctp_ipv6addr_param))
+		return false;
+
 	addr->v6.sin6_family = AF_INET6;
 	addr->v6.sin6_port = port;
 	addr->v6.sin6_flowinfo = 0; /* BUG */
 	addr->v6.sin6_addr = param->v6.addr;
 	addr->v6.sin6_scope_id = iif;
+
+	return true;
 }
 
 /* Initialize an address parameter from a sctp_addr and return the length
@@ -497,44 +503,47 @@ static void sctp_v6_to_addr(union sctp_addr *addr, struct in6_addr *saddr,
 	addr->v6.sin6_scope_id = 0;
 }
 
+static int __sctp_v6_cmp_addr(const union sctp_addr *addr1,
+			      const union sctp_addr *addr2)
+{
+	if (addr1->sa.sa_family != addr2->sa.sa_family) {
+		if (addr1->sa.sa_family == AF_INET &&
+		    addr2->sa.sa_family == AF_INET6 &&
+		    ipv6_addr_v4mapped(&addr2->v6.sin6_addr) &&
+		    addr2->v6.sin6_addr.s6_addr32[3] ==
+		    addr1->v4.sin_addr.s_addr)
+			return 1;
+
+		if (addr2->sa.sa_family == AF_INET &&
+		    addr1->sa.sa_family == AF_INET6 &&
+		    ipv6_addr_v4mapped(&addr1->v6.sin6_addr) &&
+		    addr1->v6.sin6_addr.s6_addr32[3] ==
+		    addr2->v4.sin_addr.s_addr)
+			return 1;
+
+		return 0;
+	}
+
+	if (!ipv6_addr_equal(&addr1->v6.sin6_addr, &addr2->v6.sin6_addr))
+		return 0;
+
+	/* If this is a linklocal address, compare the scope_id. */
+	if ((ipv6_addr_type(&addr1->v6.sin6_addr) & IPV6_ADDR_LINKLOCAL) &&
+	    addr1->v6.sin6_scope_id && addr2->v6.sin6_scope_id &&
+	    addr1->v6.sin6_scope_id != addr2->v6.sin6_scope_id)
+		return 0;
+
+	return 1;
+}
+
 /* Compare addresses exactly.
  * v4-mapped-v6 is also in consideration.
  */
 static int sctp_v6_cmp_addr(const union sctp_addr *addr1,
 			    const union sctp_addr *addr2)
 {
-	if (addr1->sa.sa_family != addr2->sa.sa_family) {
-		if (addr1->sa.sa_family == AF_INET &&
-		    addr2->sa.sa_family == AF_INET6 &&
-		    ipv6_addr_v4mapped(&addr2->v6.sin6_addr)) {
-			if (addr2->v6.sin6_port == addr1->v4.sin_port &&
-			    addr2->v6.sin6_addr.s6_addr32[3] ==
-			    addr1->v4.sin_addr.s_addr)
-				return 1;
-		}
-		if (addr2->sa.sa_family == AF_INET &&
-		    addr1->sa.sa_family == AF_INET6 &&
-		    ipv6_addr_v4mapped(&addr1->v6.sin6_addr)) {
-			if (addr1->v6.sin6_port == addr2->v4.sin_port &&
-			    addr1->v6.sin6_addr.s6_addr32[3] ==
-			    addr2->v4.sin_addr.s_addr)
-				return 1;
-		}
-		return 0;
-	}
-	if (addr1->v6.sin6_port != addr2->v6.sin6_port)
-		return 0;
-	if (!ipv6_addr_equal(&addr1->v6.sin6_addr, &addr2->v6.sin6_addr))
-		return 0;
-	/* If this is a linklocal address, compare the scope_id. */
-	if (ipv6_addr_type(&addr1->v6.sin6_addr) & IPV6_ADDR_LINKLOCAL) {
-		if (addr1->v6.sin6_scope_id && addr2->v6.sin6_scope_id &&
-		    (addr1->v6.sin6_scope_id != addr2->v6.sin6_scope_id)) {
-			return 0;
-		}
-	}
-
-	return 1;
+	return __sctp_v6_cmp_addr(addr1, addr2) &&
+	       addr1->v6.sin6_port == addr2->v6.sin6_port;
 }
 
 /* Initialize addr struct to INADDR_ANY. */
@@ -821,8 +830,8 @@ static int sctp_inet6_cmp_addr(const union sctp_addr *addr1,
 			       const union sctp_addr *addr2,
 			       struct sctp_sock *opt)
 {
-	struct sctp_af *af1, *af2;
 	struct sock *sk = sctp_opt2sk(opt);
+	struct sctp_af *af1, *af2;
 
 	af1 = sctp_get_af_specific(addr1->sa.sa_family);
 	af2 = sctp_get_af_specific(addr2->sa.sa_family);
@@ -838,10 +847,7 @@ static int sctp_inet6_cmp_addr(const union sctp_addr *addr1,
 	if (sctp_is_any(sk, addr1) || sctp_is_any(sk, addr2))
 		return 1;
 
-	if (addr1->sa.sa_family != addr2->sa.sa_family)
-		return 0;
-
-	return af1->cmp_addr(addr1, addr2);
+	return __sctp_v6_cmp_addr(addr1, addr2);
 }
 
 /* Verify that the provided sockaddr looks bindable.   Common verification,

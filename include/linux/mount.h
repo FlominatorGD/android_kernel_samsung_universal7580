@@ -1,6 +1,6 @@
 /*
  *
- * Definitions for mount interface. This describes the in the kernel build 
+ * Definitions for mount interface. This describes the in the kernel build
  * linkedlist with mounted filesystems.
  *
  * Author:  Marco van Wieringen <mvw@planets.elm.net>
@@ -48,6 +48,9 @@ struct mnt_namespace;
 
 #define MNT_ATIME_MASK (MNT_NOATIME | MNT_NODIRATIME | MNT_RELATIME )
 
+#define MNT_INTERNAL_FLAGS (MNT_SHARED | MNT_WRITE_HOLD | MNT_INTERNAL | \
+			    MNT_MARKED)
+
 #define MNT_INTERNAL	0x4000
 
 #define MNT_LOCK_ATIME		0x040000
@@ -55,6 +58,7 @@ struct mnt_namespace;
 #define MNT_LOCK_NOSUID		0x100000
 #define MNT_LOCK_NODEV		0x200000
 #define MNT_LOCK_READONLY	0x400000
+#define MNT_MARKED		0x4000000
 
 struct vfsmount {
 	struct dentry *mnt_root;	/* root of the mounted tree */
@@ -84,6 +88,8 @@ extern struct vfsmount *vfs_kern_mount(struct file_system_type *type,
 extern void mnt_set_expiry(struct vfsmount *mnt, struct list_head *expiry_list);
 extern void mark_mounts_for_expiry(struct list_head *mounts);
 
-extern dev_t name_to_dev_t(char *name);
+extern dev_t name_to_dev_t(const char *name);
+
+extern unsigned int sysctl_mount_max;
 
 #endif /* _LINUX_MOUNT_H */

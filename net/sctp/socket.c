@@ -333,6 +333,18 @@ static struct sctp_af *sctp_sockaddr_af(struct sctp_sock *opt,
 	return af;
 }
 
+static void sctp_auto_asconf_init(struct sctp_sock *sp)
+{
+	struct net *net = sock_net(&sp->inet.sk);
+
+	if (net->sctp.default_auto_asconf) {
+		spin_lock(&net->sctp.addr_wq_lock);
+		list_add_tail(&sp->auto_asconf_list, &net->sctp.auto_asconf_splist);
+		spin_unlock(&net->sctp.addr_wq_lock);
+		sp->do_auto_asconf = 1;
+	}
+}
+
 /* Bind a local address either to an endpoint or to an association.  */
 SCTP_STATIC int sctp_do_bind(struct sock *sk, union sctp_addr *addr, int len)
 {
@@ -400,8 +412,10 @@ SCTP_STATIC int sctp_do_bind(struct sock *sk, union sctp_addr *addr, int len)
 	}
 
 	/* Refresh ephemeral port.  */
-	if (!bp->port)
+	if (!bp->port) {
 		bp->port = inet_sk(sk)->inet_num;
+		sctp_auto_asconf_init(sp);
+	}
 
 	/* Add the address to the bind address list.
 	 * Use GFP_ATOMIC since BHs will be disabled.
@@ -1611,7 +1625,7 @@ SCTP_STATIC int sctp_sendmsg(struct kiocb *iocb, struct sock *sk,
 	struct net *net = sock_net(sk);
 	struct sctp_sock *sp;
 	struct sctp_endpoint *ep;
-	struct sctp_association *new_asoc=NULL, *asoc=NULL;
+	struct sctp_association *new_asoc = NULL, *asoc = NULL;
 	struct sctp_transport *transport, *chunk_tp;
 	struct sctp_chunk *chunk;
 	union sctp_addr to;
@@ -2503,7 +2517,7 @@ static int sctp_setsockopt_peer_addr_params(struct sock *sk,
 	int hb_change, pmtud_change, sackdelay_change;
 
 	if (optlen != sizeof(struct sctp_paddrparams))
-		return - EINVAL;
+		return -EINVAL;
 
 	if (copy_from_user(&params, optval, optlen))
 		return -EFAULT;
@@ -2524,7 +2538,7 @@ static int sctp_setsockopt_peer_addr_params(struct sock *sk,
 	/* If an address other than INADDR_ANY is specified, and
 	 * no transport is found, then the request is invalid.
 	 */
-	if (!sctp_is_any(sk, ( union sctp_addr *)&params.spp_address)) {
+	if (!sctp_is_any(sk, (union sctp_addr *)&params.spp_address)) {
 		trans = sctp_addr_id2transport(sk, &params.spp_address,
 					       params.spp_assoc_id);
 		if (!trans)
@@ -2629,7 +2643,7 @@ static int sctp_setsockopt_delayed_ack(struct sock *sk,
 		else
 			params.sack_freq = 0;
 	} else
-		return - EINVAL;
+		return -EINVAL;
 
 	/* Validate value parameter. */
 	if (params.sack_delay > 500)
@@ -2945,13 +2959,8 @@ static int sctp_setsockopt_associnfo(struct sock *sk, char __user *optval, unsig
 			asoc->max_retrans = assocparams.sasoc_asocmaxrxt;
 		}
 
-		if (assocparams.sasoc_cookie_life != 0) {
-			asoc->cookie_life.tv_sec =
-					assocparams.sasoc_cookie_life / 1000;
-			asoc->cookie_life.tv_usec =
-					(assocparams.sasoc_cookie_life % 1000)
-					* 1000;
-		}
+		if (assocparams.sasoc_cookie_life != 0)
+			asoc->cookie_life = ms_to_ktime(assocparams.sasoc_cookie_life);
 	} else {
 		/* Set the values to the endpoint */
 		struct sctp_sock *sp = sctp_sk(sk);
@@ -3366,7 +3375,7 @@ static int sctp_setsockopt_hmac_ident(struct sock *sk,
 	if (optlen < sizeof(struct sctp_hmacalgo))
 		return -EINVAL;
 
-	hmacs= memdup_user(optval, optlen);
+	hmacs = memdup_user(optval, optlen);
 	if (IS_ERR(hmacs))
 		return PTR_ERR(hmacs);
 
@@ -3404,7 +3413,7 @@ static int sctp_setsockopt_auth_key(struct sock *sk,
 	if (optlen <= sizeof(struct sctp_authkey))
 		return -EINVAL;
 
-	authkey= memdup_user(optval, optlen);
+	authkey = memdup_user(optval, optlen);
 	if (IS_ERR(authkey))
 		return PTR_ERR(authkey);
 
@@ -4014,19 +4023,6 @@ SCTP_STATIC int sctp_init_sock(struct sock *sk)
 	percpu_counter_inc(&sctp_sockets_allocated);
 	sock_prot_inuse_add(net, sk->sk_prot, 1);
 
-	/* Nothing can fail after this block, otherwise
-	 * sctp_destroy_sock() will be called without addr_wq_lock held
-	 */
-	if (net->sctp.default_auto_asconf) {
-		spin_lock(&sock_net(sk)->sctp.addr_wq_lock);
-		list_add_tail(&sp->auto_asconf_list,
-		    &net->sctp.auto_asconf_splist);
-		sp->do_auto_asconf = 1;
-		spin_unlock(&sock_net(sk)->sctp.addr_wq_lock);
-	} else {
-		sp->do_auto_asconf = 0;
-	}
-
 	local_bh_enable();
 
 	return 0;
@@ -4511,7 +4507,7 @@ static int sctp_getsockopt_peer_addr_params(struct sock *sk, int len,
 	/* If an address other than INADDR_ANY is specified, and
 	 * no transport is found, then the request is invalid.
 	 */
-	if (!sctp_is_any(sk, ( union sctp_addr *)&params.spp_address)) {
+	if (!sctp_is_any(sk, (union sctp_addr *)&params.spp_address)) {
 		trans = sctp_addr_id2transport(sk, &params.spp_address,
 					       params.spp_assoc_id);
 		if (!trans) {
@@ -4622,7 +4618,7 @@ static int sctp_getsockopt_delayed_ack(struct sock *sk, int len,
 		if (copy_from_user(&params, optval, len))
 			return -EFAULT;
 	} else
-		return - EINVAL;
+		return -EINVAL;
 
 	/* Get association, if sack_assoc_id != 0 and the socket is a one
 	 * to many style socket, and an association was not found, then
@@ -4712,8 +4708,8 @@ static int sctp_getsockopt_peer_addrs(struct sock *sk, int len,
 	if (!asoc)
 		return -EINVAL;
 
-	to = optval + offsetof(struct sctp_getaddrs,addrs);
-	space_left = len - offsetof(struct sctp_getaddrs,addrs);
+	to = optval + offsetof(struct sctp_getaddrs, addrs);
+	space_left = len - offsetof(struct sctp_getaddrs, addrs);
 
 	list_for_each_entry(from, &asoc->peer.transport_addr_list,
 				transports) {
@@ -4773,7 +4769,7 @@ static int sctp_copy_laddrs(struct sock *sk, __u16 port, void *to,
 		memcpy(to, &temp, addrlen);
 
 		to += addrlen;
-		cnt ++;
+		cnt++;
 		space_left -= addrlen;
 		*bytes_copied += addrlen;
 	}
@@ -4822,8 +4818,8 @@ static int sctp_getsockopt_local_addrs(struct sock *sk, int len,
 		bp = &asoc->base.bind_addr;
 	}
 
-	to = optval + offsetof(struct sctp_getaddrs,addrs);
-	space_left = len - offsetof(struct sctp_getaddrs,addrs);
+	to = optval + offsetof(struct sctp_getaddrs, addrs);
+	space_left = len - offsetof(struct sctp_getaddrs, addrs);
 
 	addrs = kmalloc(space_left, GFP_KERNEL);
 	if (!addrs)
@@ -4862,7 +4858,7 @@ static int sctp_getsockopt_local_addrs(struct sock *sk, int len,
 		memcpy(buf, &temp, addrlen);
 		buf += addrlen;
 		bytes_copied += addrlen;
-		cnt ++;
+		cnt++;
 		space_left -= addrlen;
 	}
 
@@ -5131,13 +5127,10 @@ static int sctp_getsockopt_associnfo(struct sock *sk, int len,
 		assocparams.sasoc_asocmaxrxt = asoc->max_retrans;
 		assocparams.sasoc_peer_rwnd = asoc->peer.rwnd;
 		assocparams.sasoc_local_rwnd = asoc->a_rwnd;
-		assocparams.sasoc_cookie_life = (asoc->cookie_life.tv_sec
-						* 1000) +
-						(asoc->cookie_life.tv_usec
-						/ 1000);
+		assocparams.sasoc_cookie_life = ktime_to_ms(asoc->cookie_life);
 
 		list_for_each(pos, &asoc->peer.transport_addr_list) {
-			cnt ++;
+			cnt++;
 		}
 
 		assocparams.sasoc_number_peer_destinations = cnt;
@@ -7050,6 +7043,8 @@ static void sctp_sock_migrate(struct sock *oldsk, struct sock *newsk,
 	 */
 	sctp_bind_addr_dup(&newsp->ep->base.bind_addr,
 				&oldsp->ep->base.bind_addr, GFP_KERNEL);
+
+	sctp_auto_asconf_init(newsp);
 
 	/* Move any messages in the old socket's receive queue that are for the
 	 * peeled off association to the new socket's receive queue.

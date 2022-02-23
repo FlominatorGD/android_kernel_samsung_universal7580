@@ -39,6 +39,7 @@
 #include <linux/elf.h>
 
 #include <asm/compat.h>
+#include <asm/cpufeature.h>
 #include <asm/debug-monitors.h>
 #include <asm/pgtable.h>
 #include <asm/syscall.h>
@@ -226,13 +227,13 @@ static int ptrace_hbp_fill_attr_ctrl(unsigned int note_type,
 				     struct arch_hw_breakpoint_ctrl ctrl,
 				     struct perf_event_attr *attr)
 {
-	int err, len, type, disabled = !ctrl.enabled;
+	int err, len, type, offset, disabled = !ctrl.enabled;
 
 	attr->disabled = disabled;
 	if (disabled)
 		return 0;
 
-	err = arch_bp_generic_fields(ctrl, &len, &type);
+	err = arch_bp_generic_fields(ctrl, &len, &type, &offset);
 	if (err)
 		return err;
 
@@ -251,6 +252,7 @@ static int ptrace_hbp_fill_attr_ctrl(unsigned int note_type,
 
 	attr->bp_len	= len;
 	attr->bp_type	= type;
+	attr->bp_addr	+= offset;
 
 	return 0;
 }
@@ -303,7 +305,7 @@ static int ptrace_hbp_get_addr(unsigned int note_type,
 	if (IS_ERR(bp))
 		return PTR_ERR(bp);
 
-	*addr = bp ? bp->attr.bp_addr : 0;
+	*addr = bp ? counter_arch_bp(bp)->address : 0;
 	return 0;
 }
 
@@ -504,7 +506,7 @@ static int gpr_set(struct task_struct *target, const struct user_regset *regset,
 	if (ret)
 		return ret;
 
-	if (!valid_user_regs(&newregs))
+	if (!valid_user_regs(&newregs, target))
 		return -EINVAL;
 
 	task_pt_regs(target)->user_regs = newregs;
@@ -536,6 +538,7 @@ static int fpr_set(struct task_struct *target, const struct user_regset *regset,
 		return ret;
 
 	target->thread.fpsimd_state.user_fpsimd = newstate;
+	fpsimd_flush_task_state(target);
 	return ret;
 }
 
@@ -562,6 +565,33 @@ static int tls_set(struct task_struct *target, const struct user_regset *regset,
 	return ret;
 }
 
+static int system_call_get(struct task_struct *target,
+			   const struct user_regset *regset,
+			   unsigned int pos, unsigned int count,
+			   void *kbuf, void __user *ubuf)
+{
+	int syscallno = task_pt_regs(target)->syscallno;
+
+	return user_regset_copyout(&pos, &count, &kbuf, &ubuf,
+				   &syscallno, 0, -1);
+}
+
+static int system_call_set(struct task_struct *target,
+			   const struct user_regset *regset,
+			   unsigned int pos, unsigned int count,
+			   const void *kbuf, const void __user *ubuf)
+{
+	int syscallno = task_pt_regs(target)->syscallno;
+	int ret;
+
+	ret = user_regset_copyin(&pos, &count, &kbuf, &ubuf, &syscallno, 0, -1);
+	if (ret)
+		return ret;
+
+	task_pt_regs(target)->syscallno = syscallno;
+	return ret;
+}
+
 enum aarch64_regset {
 	REGSET_GPR,
 	REGSET_FPR,
@@ -570,6 +600,7 @@ enum aarch64_regset {
 	REGSET_HW_BREAK,
 	REGSET_HW_WATCH,
 #endif
+	REGSET_SYSTEM_CALL,
 };
 
 static const struct user_regset aarch64_regsets[] = {
@@ -619,6 +650,14 @@ static const struct user_regset aarch64_regsets[] = {
 		.set = hw_break_set,
 	},
 #endif
+	[REGSET_SYSTEM_CALL] = {
+		.core_note_type = NT_ARM_SYSTEM_CALL,
+		.n = 1,
+		.size = sizeof(int),
+		.align = sizeof(int),
+		.get = system_call_get,
+		.set = system_call_set,
+	},
 };
 
 static const struct user_regset_view user_aarch64_view = {
@@ -669,11 +708,18 @@ static int compat_gpr_get(struct task_struct *target,
 			reg = task_pt_regs(target)->regs[idx];
 		}
 
-		ret = copy_to_user(ubuf, &reg, sizeof(reg));
-		if (ret)
-			break;
+		if (kbuf) {
+			memcpy(kbuf, &reg, sizeof(reg));
+			kbuf += sizeof(reg);
+		} else {
+			ret = copy_to_user(ubuf, &reg, sizeof(reg));
+			if (ret) {
+				ret = -EFAULT;
+				break;
+			}
 
-		ubuf += sizeof(reg);
+			ubuf += sizeof(reg);
+		}
 	}
 
 	return ret;
@@ -703,11 +749,18 @@ static int compat_gpr_set(struct task_struct *target,
 		unsigned int idx = start + i;
 		compat_ulong_t reg;
 
-		ret = copy_from_user(&reg, ubuf, sizeof(reg));
-		if (ret)
-			return ret;
+		if (kbuf) {
+			memcpy(&reg, kbuf, sizeof(reg));
+			kbuf += sizeof(reg);
+		} else {
+			ret = copy_from_user(&reg, ubuf, sizeof(reg));
+			if (ret) {
+				ret = -EFAULT;
+				break;
+			}
 
-		ubuf += sizeof(reg);
+			ubuf += sizeof(reg);
+		}
 
 		switch (idx) {
 		case 15:
@@ -725,7 +778,7 @@ static int compat_gpr_set(struct task_struct *target,
 
 	}
 
-	if (valid_user_regs(&newregs.user_regs))
+	if (valid_user_regs(&newregs.user_regs, target))
 		*task_pt_regs(target) = newregs;
 	else
 		ret = -EINVAL;
@@ -783,6 +836,7 @@ static int compat_vfp_set(struct task_struct *target,
 		uregs->fpcr = fpscr & VFP_FPSCR_CTRL_MASK;
 	}
 
+	fpsimd_flush_task_state(target);
 	return ret;
 }
 
@@ -941,9 +995,7 @@ static int compat_ptrace_gethbpregs(struct task_struct *tsk, compat_long_t num,
 {
 	int ret;
 	u32 kdata;
-	mm_segment_t old_fs = get_fs();
 
-	set_fs(KERNEL_DS);
 	/* Watchpoint */
 	if (num < 0) {
 		ret = compat_ptrace_hbp_get(NT_ARM_HW_WATCH, tsk, num, &kdata);
@@ -954,7 +1006,6 @@ static int compat_ptrace_gethbpregs(struct task_struct *tsk, compat_long_t num,
 	} else {
 		ret = compat_ptrace_hbp_get(NT_ARM_HW_BREAK, tsk, num, &kdata);
 	}
-	set_fs(old_fs);
 
 	if (!ret)
 		ret = put_user(kdata, data);
@@ -967,7 +1018,6 @@ static int compat_ptrace_sethbpregs(struct task_struct *tsk, compat_long_t num,
 {
 	int ret;
 	u32 kdata = 0;
-	mm_segment_t old_fs = get_fs();
 
 	if (num == 0)
 		return 0;
@@ -976,12 +1026,10 @@ static int compat_ptrace_sethbpregs(struct task_struct *tsk, compat_long_t num,
 	if (ret)
 		return ret;
 
-	set_fs(KERNEL_DS);
 	if (num < 0)
 		ret = compat_ptrace_hbp_set(NT_ARM_HW_WATCH, tsk, num, &kdata);
 	else
 		ret = compat_ptrace_hbp_set(NT_ARM_HW_BREAK, tsk, num, &kdata);
-	set_fs(old_fs);
 
 	return ret;
 }
@@ -1078,20 +1126,7 @@ const struct user_regset_view *task_user_regset_view(struct task_struct *task)
 long arch_ptrace(struct task_struct *child, long request,
 		 unsigned long addr, unsigned long data)
 {
-	int ret;
-
-
-	switch (request) {
-		case PTRACE_SET_SYSCALL:
-			task_pt_regs(child)->syscallno = data;
-			ret = 0;
-			break;
-		default:
-			ret = ptrace_request(child, request, addr, data);
-			break;
-	}
-
-	return ret;
+	return ptrace_request(child, request, addr, data);
 }
 
 enum ptrace_syscall_dir {
@@ -1123,32 +1158,15 @@ static void tracehook_report_syscall(struct pt_regs *regs,
 
 asmlinkage int syscall_trace_enter(struct pt_regs *regs)
 {
-	unsigned int saved_syscallno = regs->syscallno;
-
-	/* Do the secure computing check first; failures should be fast. */
-	if (secure_computing(regs->syscallno) == -1)
-		return RET_SKIP_SYSCALL_TRACE;
-
 	if (test_thread_flag(TIF_SYSCALL_TRACE))
 		tracehook_report_syscall(regs, PTRACE_SYSCALL_ENTER);
 
-	if (IS_SKIP_SYSCALL(regs->syscallno)) {
-		/*
-		 * RESTRICTION: we can't modify a return value of user
-		 * issued syscall(-1) here. In order to ease this flavor,
-		 * we need to treat whatever value in x0 as a return value,
-		 * but this might result in a bogus value being returned.
-		 */
-		/*
-		 * NOTE: syscallno may also be set to -1 if fatal signal is
-		 * detected in tracehook_report_syscall_entry(), but since
-		 * a value set to x0 here is not used in this case, we may
-		 * neglect the case.
-		 */
-		if (!test_thread_flag(TIF_SYSCALL_TRACE) ||
-				(IS_SKIP_SYSCALL(saved_syscallno)))
-			regs->regs[0] = -ENOSYS;
-	}
+	/* Do the secure computing after ptrace; failures should be fast. */
+	if (secure_computing(regs->syscallno) == -1)
+		return -1;
+
+	if (test_thread_flag(TIF_SYSCALL_TRACEPOINT))
+		trace_sys_enter(regs, regs->syscallno);
 
 	audit_syscall_entry(syscall_get_arch(), regs->syscallno,
 		regs->orig_x0, regs->regs[1], regs->regs[2], regs->regs[3]);
@@ -1160,6 +1178,85 @@ asmlinkage void syscall_trace_exit(struct pt_regs *regs)
 {
 	audit_syscall_exit(regs);
 
+	if (test_thread_flag(TIF_SYSCALL_TRACEPOINT))
+		trace_sys_exit(regs, regs_return_value(regs));
+
 	if (test_thread_flag(TIF_SYSCALL_TRACE))
 		tracehook_report_syscall(regs, PTRACE_SYSCALL_EXIT);
+}
+
+/*
+ * Bits which are always architecturally RES0 per ARM DDI 0487A.h
+ * Userspace cannot use these until they have an architectural meaning.
+ * We also reserve IL for the kernel; SS is handled dynamically.
+ */
+#define SPSR_EL1_AARCH64_RES0_BITS \
+	(GENMASK_ULL(63,32) | GENMASK_ULL(27, 22) | GENMASK_ULL(20, 10) | \
+	 GENMASK_ULL(5, 5))
+#define SPSR_EL1_AARCH32_RES0_BITS \
+	(GENMASK_ULL(63,32) | GENMASK_ULL(24, 22) | GENMASK_ULL(20,20))
+
+static int valid_compat_regs(struct user_pt_regs *regs)
+{
+	regs->pstate &= ~SPSR_EL1_AARCH32_RES0_BITS;
+
+	if (!system_supports_mixed_endian_el0()) {
+		if (IS_ENABLED(CONFIG_CPU_BIG_ENDIAN))
+			regs->pstate |= COMPAT_PSR_E_BIT;
+		else
+			regs->pstate &= ~COMPAT_PSR_E_BIT;
+	}
+
+	if (user_mode(regs) && (regs->pstate & PSR_MODE32_BIT) &&
+	    (regs->pstate & COMPAT_PSR_A_BIT) == 0 &&
+	    (regs->pstate & COMPAT_PSR_I_BIT) == 0 &&
+	    (regs->pstate & COMPAT_PSR_F_BIT) == 0) {
+		return 1;
+	}
+
+	/*
+	 * Force PSR to a valid 32-bit EL0t, preserving the same bits as
+	 * arch/arm.
+	 */
+	regs->pstate &= COMPAT_PSR_N_BIT | COMPAT_PSR_Z_BIT |
+			COMPAT_PSR_C_BIT | COMPAT_PSR_V_BIT |
+			COMPAT_PSR_Q_BIT | COMPAT_PSR_IT_MASK |
+			COMPAT_PSR_GE_MASK | COMPAT_PSR_E_BIT |
+			COMPAT_PSR_T_BIT;
+	regs->pstate |= PSR_MODE32_BIT;
+
+	return 0;
+}
+
+static int valid_native_regs(struct user_pt_regs *regs)
+{
+	regs->pstate &= ~SPSR_EL1_AARCH64_RES0_BITS;
+
+	if (user_mode(regs) && !(regs->pstate & PSR_MODE32_BIT) &&
+	    (regs->pstate & PSR_D_BIT) == 0 &&
+	    (regs->pstate & PSR_A_BIT) == 0 &&
+	    (regs->pstate & PSR_I_BIT) == 0 &&
+	    (regs->pstate & PSR_F_BIT) == 0) {
+		return 1;
+	}
+
+	/* Force PSR to a valid 64-bit EL0t */
+	regs->pstate &= PSR_N_BIT | PSR_Z_BIT | PSR_C_BIT | PSR_V_BIT;
+
+	return 0;
+}
+
+/*
+ * Are the current registers suitable for user mode? (used to maintain
+ * security in signal handlers)
+ */
+int valid_user_regs(struct user_pt_regs *regs, struct task_struct *task)
+{
+	if (!test_tsk_thread_flag(task, TIF_SINGLESTEP))
+		regs->pstate &= ~DBG_SPSR_SS;
+
+	if (is_compat_thread(task_thread_info(task)))
+		return valid_compat_regs(regs);
+	else
+		return valid_native_regs(regs);
 }

@@ -35,10 +35,6 @@
 #include <linux/cleancache.h>
 #include "internal.h"
 
-#ifdef CONFIG_SDP
-#include <sdp/cache_cleanup.h>
-#endif
-
 #define CREATE_TRACE_POINTS
 #include <trace/events/filemap.h>
 
@@ -140,11 +136,6 @@ static void page_cache_tree_delete(struct address_space *mapping,
 void __delete_from_page_cache(struct page *page, void *shadow)
 {
 	struct address_space *mapping = page->mapping;
-
-#ifdef CONFIG_SDP
-	if(mapping_sensitive(mapping))
-		sdp_page_cleanup(page);
-#endif
 
 	trace_mm_filemap_delete_from_page_cache(page);
 	/*
@@ -317,18 +308,16 @@ int filemap_fdatawait_range(struct address_space *mapping, loff_t start_byte,
 		goto out;
 
 	pagevec_init(&pvec, 0);
-	while ((index <= end) &&
-			(nr_pages = pagevec_lookup_tag(&pvec, mapping, &index,
-			PAGECACHE_TAG_WRITEBACK,
-			min(end - index, (pgoff_t)PAGEVEC_SIZE-1) + 1)) != 0) {
+	while (index <= end) {
 		unsigned i;
+
+		nr_pages = pagevec_lookup_range_tag(&pvec, mapping, &index,
+				end, PAGECACHE_TAG_WRITEBACK);
+		if (!nr_pages)
+			break;
 
 		for (i = 0; i < nr_pages; i++) {
 			struct page *page = pvec.pages[i];
-
-			/* until radix tree lookup accepts end_index */
-			if (page->index > end)
-				continue;
 
 			wait_on_page_writeback(page);
 			if (TestClearPageError(page))
@@ -660,6 +649,34 @@ void end_page_writeback(struct page *page)
 }
 EXPORT_SYMBOL(end_page_writeback);
 
+/*
+ * After completing I/O on a page, call this routine to update the page
+ * flags appropriately
+ */
+void page_endio(struct page *page, int rw, int err)
+{
+	if (rw == READ) {
+		if (!err) {
+			SetPageUptodate(page);
+		} else {
+			ClearPageUptodate(page);
+			SetPageError(page);
+		}
+		unlock_page(page);
+	} else { /* rw == WRITE */
+		if (err) {
+			struct address_space *mapping;
+
+			SetPageError(page);
+			mapping = page_mapping(page);
+			if (mapping)
+				mapping_set_error(mapping, err);
+		}
+		end_page_writeback(page);
+	}
+}
+EXPORT_SYMBOL_GPL(page_endio);
+
 /**
  * __lock_page - get a lock on the page, assuming we need to sleep to get it
  * @page: the page to lock
@@ -713,6 +730,82 @@ int __lock_page_or_retry(struct page *page, struct mm_struct *mm,
 		return 1;
 	}
 }
+
+/**
+ * page_cache_next_hole - find the next hole (not-present entry)
+ * @mapping: mapping
+ * @index: index
+ * @max_scan: maximum range to search
+ *
+ * Search the set [index, min(index+max_scan-1, MAX_INDEX)] for the
+ * lowest indexed hole.
+ *
+ * Returns: the index of the hole if found, otherwise returns an index
+ * outside of the set specified (in which case 'return - index >=
+ * max_scan' will be true). In rare cases of index wrap-around, 0 will
+ * be returned.
+ *
+ * page_cache_next_hole may be called under rcu_read_lock. However,
+ * like radix_tree_gang_lookup, this will not atomically search a
+ * snapshot of the tree at a single point in time. For example, if a
+ * hole is created at index 5, then subsequently a hole is created at
+ * index 10, page_cache_next_hole covering both indexes may return 10
+ * if called under rcu_read_lock.
+ */
+pgoff_t page_cache_next_hole(struct address_space *mapping,
+			     pgoff_t index, unsigned long max_scan)
+{
+	unsigned long i;
+
+	for (i = 0; i < max_scan; i++) {
+		if (!radix_tree_lookup(&mapping->page_tree, index))
+			break;
+		index++;
+		if (index == 0)
+			break;
+	}
+
+	return index;
+}
+EXPORT_SYMBOL(page_cache_next_hole);
+
+/**
+ * page_cache_prev_hole - find the prev hole (not-present entry)
+ * @mapping: mapping
+ * @index: index
+ * @max_scan: maximum range to search
+ *
+ * Search backwards in the range [max(index-max_scan+1, 0), index] for
+ * the first hole.
+ *
+ * Returns: the index of the hole if found, otherwise returns an index
+ * outside of the set specified (in which case 'index - return >=
+ * max_scan' will be true). In rare cases of wrap-around, ULONG_MAX
+ * will be returned.
+ *
+ * page_cache_prev_hole may be called under rcu_read_lock. However,
+ * like radix_tree_gang_lookup, this will not atomically search a
+ * snapshot of the tree at a single point in time. For example, if a
+ * hole is created at index 10, then subsequently a hole is created at
+ * index 5, page_cache_prev_hole covering both indexes may return 5 if
+ * called under rcu_read_lock.
+ */
+pgoff_t page_cache_prev_hole(struct address_space *mapping,
+			     pgoff_t index, unsigned long max_scan)
+{
+	unsigned long i;
+
+	for (i = 0; i < max_scan; i++) {
+		if (!radix_tree_lookup(&mapping->page_tree, index))
+			break;
+		index--;
+		if (index == ULONG_MAX)
+			break;
+	}
+
+	return index;
+}
+EXPORT_SYMBOL(page_cache_prev_hole);
 
 /**
  * find_get_page - find and get a page reference
@@ -991,9 +1084,10 @@ repeat:
 EXPORT_SYMBOL(find_get_pages_contig);
 
 /**
- * find_get_pages_tag - find and return pages that match @tag
+ * find_get_pages_range_tag - find and return pages in given range matching @tag
  * @mapping:	the address_space to search
  * @index:	the starting page index
+ * @end:	The final page index (inclusive)
  * @tag:	the tag index
  * @nr_pages:	the maximum number of pages
  * @pages:	where the resulting pages are placed
@@ -1001,8 +1095,9 @@ EXPORT_SYMBOL(find_get_pages_contig);
  * Like find_get_pages, except we only return pages which are tagged with
  * @tag.   We update @index to index the next page for the traversal.
  */
-unsigned find_get_pages_tag(struct address_space *mapping, pgoff_t *index,
-			int tag, unsigned int nr_pages, struct page **pages)
+unsigned find_get_pages_range_tag(struct address_space *mapping, pgoff_t *index,
+			pgoff_t end, int tag, unsigned int nr_pages,
+			struct page **pages)
 {
 	struct radix_tree_iter iter;
 	void **slot;
@@ -1016,6 +1111,9 @@ restart:
 	radix_tree_for_each_tagged(slot, &mapping->page_tree,
 				   &iter, *index, tag) {
 		struct page *page;
+
+		if (iter.index > end)
+			break;
 repeat:
 		page = radix_tree_deref_slot(slot);
 		if (unlikely(!page))
@@ -1047,18 +1145,28 @@ repeat:
 		}
 
 		pages[ret] = page;
-		if (++ret == nr_pages)
-			break;
+		if (++ret == nr_pages) {
+			*index = pages[ret - 1]->index + 1;
+			goto out;
+		}
 	}
 
+	/*
+	 * We come here when we got at @end. We take care to not overflow the
+	 * index @index as it confuses some of the callers. This breaks the
+	 * iteration when there is page at index -1 but that is already broken
+	 * anyway.
+	 */
+	if (end == (pgoff_t)-1)
+		*index = (pgoff_t)-1;
+	else
+		*index = end + 1;
+out:
 	rcu_read_unlock();
-
-	if (ret)
-		*index = pages[ret - 1]->index + 1;
 
 	return ret;
 }
-EXPORT_SYMBOL(find_get_pages_tag);
+EXPORT_SYMBOL(find_get_pages_range_tag);
 
 /**
  * grab_cache_page_nowait - returns locked page at given index in given cache
@@ -1174,6 +1282,15 @@ find_page:
 					index, last_index - index);
 		}
 		if (!PageUptodate(page)) {
+			/*
+			 * See comment in do_read_cache_page on why
+			 * wait_on_page_locked is used to avoid unnecessarily
+			 * serialisations and why it's safe.
+			 */
+			wait_on_page_locked_killable(page);
+			if (PageUptodate(page))
+				goto page_ok;
+
 			if (inode->i_blkbits == PAGE_CACHE_SHIFT ||
 					!mapping->a_ops->is_partially_uptodate)
 				goto page_not_up_to_date;
@@ -1462,30 +1579,28 @@ generic_file_aio_read(struct kiocb *iocb, const struct iovec *iov,
 		if (!count)
 			goto out; /* skip atime */
 		size = i_size_read(inode);
-		if (pos < size) {
-			retval = filemap_write_and_wait_range(mapping, pos,
+		retval = filemap_write_and_wait_range(mapping, pos,
 					pos + iov_length(iov, nr_segs) - 1);
-			if (!retval) {
-				retval = mapping->a_ops->direct_IO(READ, iocb,
-							iov, pos, nr_segs);
-			}
-			if (retval > 0) {
-				*ppos = pos + retval;
-				count -= retval;
-			}
+		if (!retval) {
+			retval = mapping->a_ops->direct_IO(READ, iocb,
+							   iov, pos, nr_segs);
+		}
+		if (retval > 0) {
+			*ppos = pos + retval;
+			count -= retval;
+		}
 
-			/*
-			 * Btrfs can have a short DIO read if we encounter
-			 * compressed extents, so if there was an error, or if
-			 * we've already read everything we wanted to, or if
-			 * there was a short read because we hit EOF, go ahead
-			 * and return.  Otherwise fallthrough to buffered io for
-			 * the rest of the read.
-			 */
-			if (retval < 0 || !count || *ppos >= size) {
-				file_accessed(filp);
-				goto out;
-			}
+		/*
+		 * Btrfs can have a short DIO read if we encounter
+		 * compressed extents, so if there was an error, or if
+		 * we've already read everything we wanted to, or if
+		 * there was a short read because we hit EOF, go ahead
+		 * and return.  Otherwise fallthrough to buffered io for
+		 * the rest of the read.
+		 */
+		if (retval < 0 || !count || *ppos >= size) {
+			file_accessed(filp);
+			goto out;
 		}
 	}
 
@@ -1600,16 +1715,7 @@ static void do_sync_mmap_readahead(struct vm_area_struct *vma,
 	/*
 	 * mmap read-around
 	 */
-
-#if CONFIG_MMAP_READAROUND_LIMIT == 0
 	ra_pages = max_sane_readahead(ra->ra_pages);
-#else
-	if (ra->ra_pages > CONFIG_MMAP_READAROUND_LIMIT)
-		ra_pages = max_sane_readahead(CONFIG_MMAP_READAROUND_LIMIT);
-	else
-		ra_pages = max_sane_readahead(ra->ra_pages);
-#endif
-
 	ra->start = max_t(long, 0, offset - ra_pages / 2);
 	ra->size = ra_pages;
 	ra->async_size = ra_pages / 4;
@@ -1888,12 +1994,52 @@ retry:
 	if (PageUptodate(page))
 		goto out;
 
+	/*
+	 * Page is not up to date and may be locked due one of the following
+	 * case a: Page is being filled and the page lock is held
+	 * case b: Read/write error clearing the page uptodate status
+	 * case c: Truncation in progress (page locked)
+	 * case d: Reclaim in progress
+	 *
+	 * Case a, the page will be up to date when the page is unlocked.
+	 *    There is no need to serialise on the page lock here as the page
+	 *    is pinned so the lock gives no additional protection. Even if the
+	 *    the page is truncated, the data is still valid if PageUptodate as
+	 *    it's a race vs truncate race.
+	 * Case b, the page will not be up to date
+	 * Case c, the page may be truncated but in itself, the data may still
+	 *    be valid after IO completes as it's a read vs truncate race. The
+	 *    operation must restart if the page is not uptodate on unlock but
+	 *    otherwise serialising on page lock to stabilise the mapping gives
+	 *    no additional guarantees to the caller as the page lock is
+	 *    released before return.
+	 * Case d, similar to truncation. If reclaim holds the page lock, it
+	 *    will be a race with remove_mapping that determines if the mapping
+	 *    is valid on unlock but otherwise the data is valid and there is
+	 *    no need to serialise with page lock.
+	 *
+	 * As the page lock gives no additional guarantee, we optimistically
+	 * wait on the page to be unlocked and check if it's up to date and
+	 * use the page if it is. Otherwise, the page lock is required to
+	 * distinguish between the different cases. The motivation is that we
+	 * avoid spurious serialisations and wakeups when multiple processes
+	 * wait on the same page for IO to complete.
+	 */
+	wait_on_page_locked(page);
+	if (PageUptodate(page))
+		goto out;
+
+	/* Distinguish between all the cases under the safety of the lock */
 	lock_page(page);
+
+	/* Case c or d, restart the operation */
 	if (!page->mapping) {
 		unlock_page(page);
 		page_cache_release(page);
 		goto retry;
 	}
+
+	/* Someone else locked and filled the page in a very small window */
 	if (PageUptodate(page)) {
 		unlock_page(page);
 		goto out;
@@ -2019,7 +2165,6 @@ size_t iov_iter_copy_from_user_atomic(struct page *page,
 	char *kaddr;
 	size_t copied;
 
-	BUG_ON(!in_atomic());
 	kaddr = kmap_atomic(page);
 	if (likely(i->nr_segs == 1)) {
 		int left;
@@ -2406,9 +2551,7 @@ again:
 		if (mapping_writably_mapped(mapping))
 			flush_dcache_page(page);
 
-		pagefault_disable();
 		copied = iov_iter_copy_from_user_atomic(page, i, offset, bytes);
-		pagefault_enable();
 		flush_dcache_page(page);
 
 		mark_page_accessed(page);

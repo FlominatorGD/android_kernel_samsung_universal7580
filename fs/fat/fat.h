@@ -10,12 +10,6 @@
 #include <linux/ratelimit.h>
 #include <linux/msdos_fs.h>
 
-#ifdef CONFIG_FAT_SUPPORT_STLOG
-#include <linux/stlog.h>
-#else
-#define ST_LOG(fmt,...) 
-#endif
-
 /*
  * vfat shortname flags
  */
@@ -58,7 +52,8 @@ struct fat_mount_options {
 		 usefree:1,	   /* Use free_clusters for FAT32 */
 		 tz_set:1,	   /* Filesystem timestamps' offset set */
 		 rodir:1,	   /* allow ATTR_RO for directory */
-		 discard:1;	   /* Issue discard requests on deletions */
+		 discard:1,	   /* Issue discard requests on deletions */
+		 dos1xfloppy:1;	   /* Assume default BPB for DOS 1.x floppies */
 };
 
 #define FAT_HASH_BITS	8
@@ -92,7 +87,7 @@ struct msdos_sb_info {
 	const void *dir_ops;	      /* Opaque; default directory operations */
 	int dir_per_block;	      /* dir entries per block */
 	int dir_per_block_bits;	      /* log2(dir_per_block) */
-	unsigned long vol_id;         /* volume ID */
+	unsigned int vol_id;		/*volume ID*/
 
 	int fatent_shift;
 	struct fatent_operations *fatent_ops;
@@ -108,6 +103,7 @@ struct msdos_sb_info {
 	struct hlist_head dir_hashtable[FAT_HASH_SIZE];
 
 	unsigned int dirty;           /* fs state before mount */
+	struct rcu_head rcu;
 };
 
 #define FAT_CACHE_VALID	0	/* special case for valid cache */
@@ -351,6 +347,11 @@ static inline void fatent_brelse(struct fat_entry *fatent)
 	fatent->fat_inode = NULL;
 }
 
+static inline bool fat_valid_entry(struct msdos_sb_info *sbi, int entry)
+{
+	return FAT_START_ENT <= entry && entry < sbi->max_cluster;
+}
+
 extern void fat_ent_access_init(struct super_block *sb);
 extern int fat_ent_read(struct inode *inode, struct fat_entry *fatent,
 			int entry);
@@ -419,14 +420,6 @@ void fat_cache_destroy(void);
 /* fat/nfs.c */
 extern const struct export_operations fat_export_ops;
 extern const struct export_operations fat_export_ops_nostale;
-
-/* fat/xattr.c */
-extern int fat_setxattr(struct dentry *dentry, const char *name,
-				const void *value, size_t size, int flags);
-extern ssize_t fat_getxattr(struct dentry *dentry, const char *name,
-				void *value, size_t size);
-extern ssize_t fat_listxattr(struct dentry *dentry, char *list, size_t size);
-extern int fat_removexattr(struct dentry *dentry, const char *name);
 
 /* helper for printk */
 typedef unsigned long long	llu;

@@ -323,7 +323,6 @@ static noinline int btrfs_ioctl_fitrim(struct file *file, void __user *arg)
 	struct fstrim_range range;
 	u64 minlen = ULLONG_MAX;
 	u64 num_devices = 0;
-	u64 total_bytes = btrfs_super_total_bytes(fs_info->super_copy);
 	int ret;
 
 	if (!capable(CAP_SYS_ADMIN))
@@ -347,11 +346,15 @@ static noinline int btrfs_ioctl_fitrim(struct file *file, void __user *arg)
 		return -EOPNOTSUPP;
 	if (copy_from_user(&range, arg, sizeof(range)))
 		return -EFAULT;
-	if (range.start > total_bytes ||
-	    range.len < fs_info->sb->s_blocksize)
+
+	/*
+	 * NOTE: Don't truncate the range using super->total_bytes.  Bytenr of
+	 * block group is in the logical address space, which can be any
+	 * sectorsize aligned bytenr in  the range [0, U64_MAX].
+	 */
+	if (range.len < fs_info->sb->s_blocksize)
 		return -EINVAL;
 
-	range.len = min(range.len, total_bytes - range.start);
 	range.minlen = max(range.minlen, minlen);
 	ret = btrfs_trim_fs(fs_info->tree_root, &range);
 	if (ret < 0)
@@ -378,6 +381,7 @@ static noinline int create_subvol(struct inode *dir,
 	struct btrfs_root *new_root;
 	struct btrfs_block_rsv block_rsv;
 	struct timespec cur_time = CURRENT_TIME;
+	struct inode *inode;
 	int ret;
 	int err;
 	u64 objectid;
@@ -535,8 +539,14 @@ fail:
 	if (err && !ret)
 		ret = err;
 
-	if (!ret)
-		d_instantiate(dentry, btrfs_lookup_dentry(dir, dentry));
+	if (!ret) {
+		inode = btrfs_lookup_dentry(dir, dentry);
+		if (IS_ERR(inode)) {
+			ret = PTR_ERR(inode);
+			goto out;
+		}
+		d_instantiate(dentry, inode);
+	}
 out:
 	btrfs_subvolume_release_metadata(root, &block_rsv, qgroup_reserved);
 	return ret;
@@ -616,7 +626,7 @@ static int create_snapshot(struct btrfs_root *root, struct inode *dir,
 		ret = PTR_ERR(inode);
 		goto fail;
 	}
-	BUG_ON(!inode);
+
 	d_instantiate(dentry, inode);
 	ret = 0;
 fail:

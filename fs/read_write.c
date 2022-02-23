@@ -41,8 +41,19 @@ static inline int unsigned_offsets(struct file *file)
 	return file->f_mode & FMODE_UNSIGNED_OFFSET;
 }
 
-static loff_t lseek_execute(struct file *file, struct inode *inode,
-		loff_t offset, loff_t maxsize)
+/**
+ * vfs_setpos - update the file offset for lseek
+ * @file:	file structure in question
+ * @offset:	file offset to seek to
+ * @maxsize:	maximum file size
+ *
+ * This is a low-level filesystem helper for updating the file offset to
+ * the value specified by @offset if the given offset is valid and it is
+ * not equal to the current file offset.
+ *
+ * Return the specified offset on success and -EINVAL on invalid offset.
+ */
+loff_t vfs_setpos(struct file *file, loff_t offset, loff_t maxsize)
 {
 	if (offset < 0 && !unsigned_offsets(file))
 		return -EINVAL;
@@ -55,6 +66,7 @@ static loff_t lseek_execute(struct file *file, struct inode *inode,
 	}
 	return offset;
 }
+EXPORT_SYMBOL(vfs_setpos);
 
 /**
  * generic_file_llseek_size - generic llseek implementation for regular files
@@ -76,8 +88,6 @@ loff_t
 generic_file_llseek_size(struct file *file, loff_t offset, int whence,
 		loff_t maxsize, loff_t eof)
 {
-	struct inode *inode = file->f_mapping->host;
-
 	switch (whence) {
 	case SEEK_END:
 		offset += eof;
@@ -97,8 +107,7 @@ generic_file_llseek_size(struct file *file, loff_t offset, int whence,
 		 * like SEEK_SET.
 		 */
 		spin_lock(&file->f_lock);
-		offset = lseek_execute(file, inode, file->f_pos + offset,
-				       maxsize);
+		offset = vfs_setpos(file, file->f_pos + offset, maxsize);
 		spin_unlock(&file->f_lock);
 		return offset;
 	case SEEK_DATA:
@@ -106,7 +115,7 @@ generic_file_llseek_size(struct file *file, loff_t offset, int whence,
 		 * In the generic case the entire file is data, so as long as
 		 * offset isn't at the end of the file then the offset is data.
 		 */
-		if (offset >= eof)
+		if ((unsigned long long)offset >= eof)
 			return -ENXIO;
 		break;
 	case SEEK_HOLE:
@@ -114,13 +123,13 @@ generic_file_llseek_size(struct file *file, loff_t offset, int whence,
 		 * There is a virtual hole at the end of the file, so as long as
 		 * offset isn't i_size or larger, return i_size.
 		 */
-		if (offset >= eof)
+		if ((unsigned long long)offset >= eof)
 			return -ENXIO;
 		offset = eof;
 		break;
 	}
 
-	return lseek_execute(file, inode, offset, maxsize);
+	return vfs_setpos(file, offset, maxsize);
 }
 EXPORT_SYMBOL(generic_file_llseek_size);
 
@@ -228,7 +237,7 @@ loff_t vfs_llseek(struct file *file, loff_t offset, int whence)
 
 	fn = no_llseek;
 	if (file->f_mode & FMODE_LSEEK) {
-		if (file->f_op && file->f_op->llseek)
+		if (file->f_op->llseek)
 			fn = file->f_op->llseek;
 	}
 	return fn(file, offset, whence);
@@ -356,7 +365,7 @@ ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
 
 	if (!(file->f_mode & FMODE_READ))
 		return -EBADF;
-	if (!file->f_op || (!file->f_op->read && !file->f_op->aio_read))
+	if (!file->f_op->read && !file->f_op->aio_read)
 		return -EINVAL;
 	if (unlikely(!access_ok(VERIFY_WRITE, buf, count)))
 		return -EFAULT;
@@ -406,7 +415,7 @@ ssize_t __kernel_write(struct file *file, const char *buf, size_t count, loff_t 
 	const char __user *p;
 	ssize_t ret;
 
-	if (!file->f_op || (!file->f_op->write && !file->f_op->aio_write))
+	if (!file->f_op->write && !file->f_op->aio_write)
 		return -EINVAL;
 
 	old_fs = get_fs();
@@ -433,7 +442,7 @@ ssize_t vfs_write(struct file *file, const char __user *buf, size_t count, loff_
 
 	if (!(file->f_mode & FMODE_WRITE))
 		return -EBADF;
-	if (!file->f_op || (!file->f_op->write && !file->f_op->aio_write))
+	if (!file->f_op->write && !file->f_op->aio_write)
 		return -EINVAL;
 	if (unlikely(!access_ok(VERIFY_READ, buf, count)))
 		return -EFAULT;
@@ -699,11 +708,6 @@ static ssize_t do_readv_writev(int type, struct file *file,
 	io_fn_t fn;
 	iov_fn_t fnv;
 
-	if (!file->f_op) {
-		ret = -EINVAL;
-		goto out;
-	}
-
 	ret = rw_copy_check_uvector(type, uvector, nr_segs,
 				    ARRAY_SIZE(iovstack), iovstack, &iov);
 	if (ret <= 0)
@@ -750,7 +754,7 @@ ssize_t vfs_readv(struct file *file, const struct iovec __user *vec,
 {
 	if (!(file->f_mode & FMODE_READ))
 		return -EBADF;
-	if (!file->f_op || (!file->f_op->aio_read && !file->f_op->read))
+	if (!file->f_op->aio_read && !file->f_op->read)
 		return -EINVAL;
 
 	return do_readv_writev(READ, file, vec, vlen, pos);
@@ -763,7 +767,7 @@ ssize_t vfs_writev(struct file *file, const struct iovec __user *vec,
 {
 	if (!(file->f_mode & FMODE_WRITE))
 		return -EBADF;
-	if (!file->f_op || (!file->f_op->aio_write && !file->f_op->write))
+	if (!file->f_op->aio_write && !file->f_op->write)
 		return -EINVAL;
 
 	return do_readv_writev(WRITE, file, vec, vlen, pos);
@@ -876,10 +880,6 @@ static ssize_t compat_do_readv_writev(int type, struct file *file,
 	io_fn_t fn;
 	iov_fn_t fnv;
 
-	ret = -EINVAL;
-	if (!file->f_op)
-		goto out;
-
 	ret = -EFAULT;
 	if (!access_ok(VERIFY_READ, uvector, nr_segs*sizeof(*uvector)))
 		goto out;
@@ -935,7 +935,7 @@ static size_t compat_readv(struct file *file,
 		goto out;
 
 	ret = -EINVAL;
-	if (!file->f_op || (!file->f_op->aio_read && !file->f_op->read))
+	if (!file->f_op->aio_read && !file->f_op->read)
 		goto out;
 
 	ret = compat_do_readv_writev(READ, file, vec, vlen, pos);
@@ -1001,7 +1001,7 @@ static size_t compat_writev(struct file *file,
 		goto out;
 
 	ret = -EINVAL;
-	if (!file->f_op || (!file->f_op->aio_write && !file->f_op->write))
+	if (!file->f_op->aio_write && !file->f_op->write)
 		goto out;
 
 	ret = compat_do_readv_writev(WRITE, file, vec, vlen, pos);

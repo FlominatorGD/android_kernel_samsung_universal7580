@@ -808,7 +808,7 @@ setup_root:
 		return dget(sb->s_root);
 	}
 
-	return d_obtain_alias(inode);
+	return d_obtain_root(inode);
 }
 
 static int btrfs_fill_super(struct super_block *sb,
@@ -1248,6 +1248,7 @@ static int btrfs_remount(struct super_block *sb, int *flags, char *data)
 	unsigned int old_metadata_ratio = fs_info->metadata_ratio;
 	int ret;
 
+	sync_filesystem(sb);
 	btrfs_remount_prepare(fs_info);
 
 	ret = btrfs_parse_options(root, data);
@@ -1579,6 +1580,7 @@ static long btrfs_control_ioctl(struct file *file, unsigned int cmd,
 	vol = memdup_user((void __user *)arg, sizeof(*vol));
 	if (IS_ERR(vol))
 		return PTR_ERR(vol);
+	vol->name[BTRFS_PATH_NAME_MAX] = '\0';
 
 	switch (cmd) {
 	case BTRFS_IOC_SCAN_DEV:

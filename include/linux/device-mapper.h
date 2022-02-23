@@ -115,24 +115,20 @@ typedef int (*dm_busy_fn) (struct dm_target *ti);
 
 void dm_error(const char *message);
 
-/*
- * Combine device limits.
- */
-int dm_set_device_limits(struct dm_target *ti, struct dm_dev *dev,
-			 sector_t start, sector_t len, void *data);
-
 struct dm_dev {
 	struct block_device *bdev;
 	fmode_t mode;
 	char name[16];
 };
 
+dev_t dm_get_dev_t(const char *path);
+
 /*
  * Constructors should call these functions to ensure destination devices
  * are opened/closed correctly.
  */
 int dm_get_device(struct dm_target *ti, const char *path, fmode_t mode,
-						 struct dm_dev **result);
+		  struct dm_dev **result);
 void dm_put_device(struct dm_target *ti, struct dm_dev *d);
 
 /*
@@ -578,7 +574,7 @@ extern struct ratelimit_state dm_ratelimit_state;
  */
 #define dm_target_offset(ti, sector) ((sector) - (ti)->begin)
 
-static inline sector_t to_sector(unsigned long n)
+static inline sector_t to_sector(unsigned long long n)
 {
 	return (n >> SECTOR_SHIFT);
 }

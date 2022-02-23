@@ -134,7 +134,7 @@ int sctp_rcv(struct sk_buff *skb)
 	struct sctp_af *af;
 	struct net *net = dev_net(skb->dev);
 
-	if (skb->pkt_type!=PACKET_HOST)
+	if (skb->pkt_type != PACKET_HOST)
 		goto discard_it;
 
 	SCTP_INC_STATS_BH(net, SCTP_MIB_INSCTPPACKS);
@@ -990,7 +990,8 @@ static struct sctp_association *__sctp_rcv_init_lookup(struct net *net,
 		if (!af)
 			continue;
 
-		af->from_addr_param(paddr, params.addr, sh->source, 0);
+		if (!af->from_addr_param(paddr, params.addr, sh->source, 0))
+			continue;
 
 		asoc = __sctp_lookup_association(net, laddr, paddr, &transport);
 		if (asoc)
@@ -1026,6 +1027,9 @@ static struct sctp_association *__sctp_rcv_asconf_lookup(
 	union sctp_addr_param *param;
 	union sctp_addr paddr;
 
+	if (ntohs(ch->length) < sizeof(*asconf) + sizeof(struct sctp_paramhdr))
+		return NULL;
+
 	/* Skip over the ADDIP header and find the Address parameter */
 	param = (union sctp_addr_param *)(asconf + 1);
 
@@ -1033,7 +1037,8 @@ static struct sctp_association *__sctp_rcv_asconf_lookup(
 	if (unlikely(!af))
 		return NULL;
 
-	af->from_addr_param(&paddr, param, peer_port, 0);
+	if (af->from_addr_param(&paddr, param, peer_port, 0))
+		return NULL;
 
 	return __sctp_lookup_association(net, laddr, &paddr, transportp);
 }
@@ -1072,7 +1077,7 @@ static struct sctp_association *__sctp_rcv_walk_lookup(struct net *net,
 		if (ch_end > skb_tail_pointer(skb))
 			break;
 
-		switch(ch->type) {
+		switch (ch->type) {
 		    case SCTP_CID_AUTH:
 			    have_auth = chunk_num;
 			    break;
@@ -1104,7 +1109,7 @@ static struct sctp_association *__sctp_rcv_walk_lookup(struct net *net,
 
 		ch = (sctp_chunkhdr_t *) ch_end;
 		chunk_num++;
-	} while (ch_end < skb_tail_pointer(skb));
+	} while (ch_end + sizeof(*ch) < skb_tail_pointer(skb));
 
 	return asoc;
 }

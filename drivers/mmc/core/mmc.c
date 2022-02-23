@@ -23,12 +23,6 @@
 #include "mmc_ops.h"
 #include "sd_ops.h"
 
-#ifdef CONFIG_MMC_SUPPORT_STLOG
-#include <linux/stlog.h>
-#else
-#define ST_LOG(fmt,...)
-#endif
-
 static const unsigned int tran_exp[] = {
 	10000,		100000,		1000000,	10000000,
 	0,		0,		0,		0
@@ -373,10 +367,6 @@ static int mmc_read_ext_csd(struct mmc_card *card, u8 *ext_csd)
 
 		/* EXT_CSD value is in units of 10ms, but we store in ms */
 		card->ext_csd.part_time = 10 * ext_csd[EXT_CSD_PART_SWITCH_TIME];
-		/* Some eMMC set the value too low so set a minimum */
-		if (card->ext_csd.part_time &&
-		    card->ext_csd.part_time < MMC_MIN_PART_SWITCH_TIME)
-			card->ext_csd.part_time = MMC_MIN_PART_SWITCH_TIME;
 
 		/* Sleep / awake timeout in 100ns units */
 		if (sa_shift > 0 && sa_shift <= 0x17)
@@ -511,6 +501,10 @@ static int mmc_read_ext_csd(struct mmc_card *card, u8 *ext_csd)
 	}
 
 	if (card->ext_csd.rev >= 5) {
+		/* Adjust production date as per JEDEC JESD84-B451 */
+		if (card->cid.year < 2010)
+			card->cid.year += 16;
+
 		/* check whether the eMMC card supports BKOPS */
 		if (ext_csd[EXT_CSD_BKOPS_SUPPORT] & 0x1) {
 			card->ext_csd.bkops = 1;
@@ -518,7 +512,7 @@ static int mmc_read_ext_csd(struct mmc_card *card, u8 *ext_csd)
 			card->ext_csd.raw_bkops_status =
 				ext_csd[EXT_CSD_BKOPS_STATUS];
 			if (!card->ext_csd.bkops_en)
-				pr_info("%s: BKOPS_EN bit is not set\n",
+				pr_debug("%s: BKOPS_EN bit is not set\n",
 					mmc_hostname(card->host));
 		}
 
@@ -594,6 +588,17 @@ static int mmc_read_ext_csd(struct mmc_card *card, u8 *ext_csd)
 	} else {
 		card->ext_csd.data_sector_size = 512;
 	}
+
+	/*
+	 * GENERIC_CMD6_TIME is to be used "unless a specific timeout is defined
+	 * when accessing a specific field", so use it here if there is no
+	 * PARTITION_SWITCH_TIME.
+	 */
+	if (!card->ext_csd.part_time)
+		card->ext_csd.part_time = card->ext_csd.generic_cmd6_time;
+	/* Some eMMC set the value too low so set a minimum */
+	if (card->ext_csd.part_time < MMC_MIN_PART_SWITCH_TIME)
+		card->ext_csd.part_time = MMC_MIN_PART_SWITCH_TIME;
 
 	/* eMMC v5.0 or later */
 	if (card->ext_csd.rev >= 7) {
@@ -1571,21 +1576,8 @@ static int mmc_init_card(struct mmc_host *host, u32 ocr,
 		}
 	}
 
-	/* if it is from resume. check bkops mode */
-	if (oldcard) {
-		if (oldcard->bkops_enable & 0xFE) {
-			/*
-			 * if bkops mode is enable before getting suspend.
-			 * turn on the bkops mode
-			 */
-			mmc_bkops_enable(oldcard->host, oldcard->bkops_enable);
-		}
-	}
-
-	if (!oldcard) {
+	if (!oldcard)
 		host->card = card;
-		ST_LOG("<%s> %s: card init succeed\n", __func__,mmc_hostname(host));
-	}
 
 	mmc_free_ext_csd(ext_csd);
 	return 0;
@@ -1691,6 +1683,12 @@ static int mmc_suspend(struct mmc_host *host)
 	mmc_claim_host(host);
 
 	mmc_wait_cmdq_empty(host);
+
+	if (mmc_card_doing_bkops(host->card)) {
+		err = mmc_stop_bkops(host->card);
+		if (err)
+			goto out;
+	}
 
 	err = mmc_flush_cache(host->card);
 	if (err)

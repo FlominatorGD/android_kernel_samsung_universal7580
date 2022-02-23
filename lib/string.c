@@ -309,12 +309,12 @@ EXPORT_SYMBOL(strchr);
  */
 char *strrchr(const char *s, int c)
 {
-       const char *p = s + strlen(s);
-       do {
-           if (*p == (char)c)
-               return (char *)p;
-       } while (--p >= s);
-       return NULL;
+	const char *last = NULL;
+	do {
+		if (*s == (char)c)
+			last = s;
+	} while (*s++);
+	return (char *)last;
 }
 EXPORT_SYMBOL(strrchr);
 #endif
@@ -598,7 +598,7 @@ EXPORT_SYMBOL(memset);
 void memzero_explicit(void *s, size_t count)
 {
 	memset(s, 0, count);
-	barrier();
+	barrier_data(s);
 }
 EXPORT_SYMBOL(memzero_explicit);
 
@@ -664,7 +664,7 @@ EXPORT_SYMBOL(memmove);
  * @count: The size of the area.
  */
 #undef memcmp
-int memcmp(const void *cs, const void *ct, size_t count)
+__visible int memcmp(const void *cs, const void *ct, size_t count)
 {
 	const unsigned char *su1, *su2;
 	int res = 0;
@@ -805,9 +805,9 @@ void *memchr_inv(const void *start, int c, size_t bytes)
 		return check_bytes8(start, value, bytes);
 
 	value64 = value;
-#if defined(ARCH_HAS_FAST_MULTIPLIER) && BITS_PER_LONG == 64
-	value64 *= 0x0101010101010101;
-#elif defined(ARCH_HAS_FAST_MULTIPLIER)
+#if defined(CONFIG_ARCH_HAS_FAST_MULTIPLIER) && BITS_PER_LONG == 64
+	value64 *= 0x0101010101010101ULL;
+#elif defined(CONFIG_ARCH_HAS_FAST_MULTIPLIER)
 	value64 *= 0x01010101;
 	value64 |= value64 << 32;
 #else

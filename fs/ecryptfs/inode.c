@@ -298,8 +298,7 @@ ecryptfs_create(struct inode *directory_inode, struct dentry *ecryptfs_dentry,
 		iput(ecryptfs_inode);
 		goto out;
 	}
-	unlock_new_inode(ecryptfs_inode);
-	d_instantiate(ecryptfs_dentry, ecryptfs_inode);
+	d_instantiate_new(ecryptfs_dentry, ecryptfs_inode);
 out:
 	return rc;
 }
@@ -358,7 +357,7 @@ static int ecryptfs_lookup_interpose(struct dentry *dentry,
 
 	lower_mnt = mntget(ecryptfs_dentry_to_lower_mnt(dentry->d_parent));
 	fsstack_copy_attr_atime(dir_inode, lower_dentry->d_parent->d_inode);
-	BUG_ON(!lower_dentry->d_count);
+	BUG_ON(!d_count(lower_dentry));
 
 	ecryptfs_set_dentry_private(dentry, dentry_info);
 	ecryptfs_set_dentry_lower(dentry, lower_dentry);
@@ -701,16 +700,6 @@ static void *ecryptfs_follow_link(struct dentry *dentry, struct nameidata *nd)
 out:
 	nd_set_link(nd, buf);
 	return NULL;
-}
-
-static void
-ecryptfs_put_link(struct dentry *dentry, struct nameidata *nd, void *ptr)
-{
-	char *buf = nd_get_link(nd);
-	if (!IS_ERR(buf)) {
-		/* Free the char* */
-		kfree(buf);
-	}
 }
 
 /**
@@ -1121,7 +1110,7 @@ out:
 const struct inode_operations ecryptfs_symlink_iops = {
 	.readlink = generic_readlink,
 	.follow_link = ecryptfs_follow_link,
-	.put_link = ecryptfs_put_link,
+	.put_link = kfree_put_link,
 	.permission = ecryptfs_permission,
 	.setattr = ecryptfs_setattr,
 	.getattr = ecryptfs_getattr_link,

@@ -138,26 +138,17 @@ static const char * const task_state_array[] = {
 	"D (disk sleep)",	/*   2 */
 	"T (stopped)",		/*   4 */
 	"t (tracing stop)",	/*   8 */
-	"Z (zombie)",		/*  16 */
-	"X (dead)",		/*  32 */
-	"x (dead)",		/*  64 */
-	"K (wakekill)",		/* 128 */
-	"W (waking)",		/* 256 */
-	"P (parked)",		/* 512 */
+	"X (dead)",		/*  16 */
+	"Z (zombie)",		/*  32 */
 };
 
 static inline const char *get_task_state(struct task_struct *tsk)
 {
-	unsigned int state = (tsk->state & TASK_REPORT) | tsk->exit_state;
-	const char * const *p = &task_state_array[0];
+	unsigned int state = (tsk->state | tsk->exit_state) & TASK_REPORT;
 
-	BUILD_BUG_ON(1 + ilog2(TASK_STATE_MAX) != ARRAY_SIZE(task_state_array));
+	BUILD_BUG_ON(1 + ilog2(TASK_REPORT) != ARRAY_SIZE(task_state_array)-1);
 
-	while (state) {
-		p++;
-		state >>= 1;
-	}
-	return *p;
+	return task_state_array[fls(state)];
 }
 
 static inline void task_state(struct seq_file *m, struct pid_namespace *ns,
@@ -405,9 +396,21 @@ static int do_task_stat(struct seq_file *m, struct pid_namespace *ns,
 	mm = get_task_mm(task);
 	if (mm) {
 		vsize = task_vsize(mm);
-		if (permitted) {
-			eip = KSTK_EIP(task);
-			esp = KSTK_ESP(task);
+		/*
+		 * esp and eip are intentionally zeroed out.  There is no
+		 * non-racy way to read them without freezing the task.
+		 * Programs that need reliable values can use ptrace(2).
+		 *
+		 * The only exception is if the task is core dumping because
+		 * a program is not able to use ptrace(2) in that case. It is
+		 * safe because the task has stopped executing permanently.
+		 */
+		if (permitted && (task->flags & (PF_EXITING|PF_DUMPCORE))) {
+			if (try_get_task_stack(task)) {
+				eip = KSTK_EIP(task);
+				esp = KSTK_ESP(task);
+				put_task_stack(task);
+			}
 		}
 	}
 
@@ -445,8 +448,7 @@ static int do_task_stat(struct seq_file *m, struct pid_namespace *ns,
 				min_flt += t->min_flt;
 				maj_flt += t->maj_flt;
 				gtime += task_gtime(t);
-				t = next_thread(t);
-			} while (t != task);
+			} while_each_thread(task, t);
 
 			min_flt += sig->min_flt;
 			maj_flt += sig->maj_flt;

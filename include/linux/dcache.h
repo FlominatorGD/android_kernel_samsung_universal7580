@@ -54,11 +54,11 @@ struct qstr {
 #define hashlen_len(hashlen)  ((u32)((hashlen) >> 32))
 
 struct dentry_stat_t {
-	int nr_dentry;
-	int nr_unused;
-	int age_limit;          /* age in seconds */
-	int want_pages;         /* pages requested by system */
-	int dummy[2];
+	long nr_dentry;
+	long nr_unused;
+	long age_limit;          /* age in seconds */
+	long want_pages;         /* pages requested by system */
+	long dummy[2];
 };
 extern struct dentry_stat_t dentry_stat;
 
@@ -146,10 +146,8 @@ enum dentry_d_lock_class
 struct dentry_operations {
 	int (*d_revalidate)(struct dentry *, unsigned int);
 	int (*d_weak_revalidate)(struct dentry *, unsigned int);
-	int (*d_hash)(const struct dentry *, const struct inode *,
-			struct qstr *);
-	int (*d_compare)(const struct dentry *, const struct inode *,
-			const struct dentry *, const struct inode *,
+	int (*d_hash)(const struct dentry *, struct qstr *);
+	int (*d_compare)(const struct dentry *, const struct dentry *,
 			unsigned int, const char *, const struct qstr *);
 	int (*d_delete)(const struct dentry *);
 	void (*d_release)(struct dentry *);
@@ -170,13 +168,13 @@ struct dentry_operations {
  */
 
 /* d_flags entries */
-#define DCACHE_OP_HASH		0x0001
-#define DCACHE_OP_COMPARE	0x0002
-#define DCACHE_OP_REVALIDATE	0x0004
-#define DCACHE_OP_DELETE	0x0008
-#define DCACHE_OP_PRUNE         0x0010
+#define DCACHE_OP_HASH			0x00000001
+#define DCACHE_OP_COMPARE		0x00000002
+#define DCACHE_OP_REVALIDATE		0x00000004
+#define DCACHE_OP_DELETE		0x00000008
+#define DCACHE_OP_PRUNE			0x00000010
 
-#define	DCACHE_DISCONNECTED	0x0020
+#define	DCACHE_DISCONNECTED		0x00000020
      /* This dentry is possibly not currently connected to the dcache tree, in
       * which case its parent will either be itself, or will have this flag as
       * well.  nfsd will not use a dentry with this bit set, but will first
@@ -187,36 +185,44 @@ struct dentry_operations {
       * dentry into place and return that dentry rather than the passed one,
       * typically using d_splice_alias. */
 
-#define DCACHE_REFERENCED	0x0040  /* Recently used, don't discard. */
-#define DCACHE_RCUACCESS	0x0080	/* Entry has ever been RCU-visible */
+#define DCACHE_REFERENCED		0x00000040 /* Recently used, don't discard. */
+#define DCACHE_RCUACCESS		0x00000080 /* Entry has ever been RCU-visible */
 
-#define DCACHE_CANT_MOUNT	0x0100
-#define DCACHE_GENOCIDE		0x0200
-#define DCACHE_SHRINK_LIST	0x0400
+#define DCACHE_CANT_MOUNT		0x00000100
+#define DCACHE_GENOCIDE			0x00000200
+#define DCACHE_SHRINK_LIST		0x00000400
 
-#define DCACHE_OP_WEAK_REVALIDATE	0x0800
+#define DCACHE_OP_WEAK_REVALIDATE	0x00000800
 
-#define DCACHE_NFSFS_RENAMED	0x1000
+#define DCACHE_NFSFS_RENAMED		0x00001000
      /* this dentry has been "silly renamed" and has to be deleted on the last
       * dput() */
-#define DCACHE_COOKIE		0x2000	/* For use by dcookie subsystem */
-#define DCACHE_FSNOTIFY_PARENT_WATCHED 0x4000
+#define DCACHE_COOKIE			0x00002000 /* For use by dcookie subsystem */
+#define DCACHE_FSNOTIFY_PARENT_WATCHED	0x00004000
      /* Parent inode is watched by some fsnotify listener */
 
-#define DCACHE_MOUNTED		0x10000	/* is a mountpoint */
-#define DCACHE_NEED_AUTOMOUNT	0x20000	/* handle automount on this dir */
-#define DCACHE_MANAGE_TRANSIT	0x40000	/* manage transit from this dirent */
+#define DCACHE_DENTRY_KILLED		0x00008000
+
+#define DCACHE_MOUNTED			0x00010000 /* is a mountpoint */
+#define DCACHE_NEED_AUTOMOUNT		0x00020000 /* handle automount on this dir */
+#define DCACHE_MANAGE_TRANSIT		0x00040000 /* manage transit from this dirent */
 #define DCACHE_MANAGED_DENTRY \
 	(DCACHE_MOUNTED|DCACHE_NEED_AUTOMOUNT|DCACHE_MANAGE_TRANSIT)
 
-#define DCACHE_DENTRY_KILLED	0x100000
-#define DCACHE_WILL_INVALIDATE		0x80000000 /* will be invalidated */
+#define DCACHE_LRU_LIST			0x00080000
+
+#define DCACHE_ENTRY_TYPE		0x00700000
+#define DCACHE_MISS_TYPE		0x00000000 /* Negative dentry */
+#define DCACHE_DIRECTORY_TYPE		0x00100000 /* Normal directory */
+#define DCACHE_AUTODIR_TYPE		0x00200000 /* Lookupless directory (presumed automount) */
+#define DCACHE_SYMLINK_TYPE		0x00300000 /* Symlink */
+#define DCACHE_FILE_TYPE		0x00400000 /* Other file type */
 
 #define DCACHE_ENCRYPTED_WITH_KEY	0x04000000 /* dir is encrypted with a valid key */
 
 extern seqlock_t rename_lock;
 
-static inline int dname_external(struct dentry *dentry)
+static inline int dname_external(const struct dentry *dentry)
 {
 	return dentry->d_name.name != dentry->d_iname;
 }
@@ -225,8 +231,10 @@ static inline int dname_external(struct dentry *dentry)
  * These are the low-level FS interfaces to the dcache..
  */
 extern void d_instantiate(struct dentry *, struct inode *);
+extern void d_instantiate_new(struct dentry *, struct inode *);
 extern struct dentry * d_instantiate_unique(struct dentry *, struct inode *);
 extern struct dentry * d_materialise_unique(struct dentry *, struct inode *);
+extern int d_instantiate_no_diralias(struct dentry *, struct inode *);
 extern void __d_drop(struct dentry *dentry);
 extern void d_drop(struct dentry *dentry);
 extern void d_delete(struct dentry *);
@@ -239,6 +247,7 @@ extern struct dentry * d_splice_alias(struct inode *, struct dentry *);
 extern struct dentry * d_add_ci(struct dentry *, struct inode *, struct qstr *);
 extern struct dentry *d_find_any_alias(struct inode *inode);
 extern struct dentry * d_obtain_alias(struct inode *);
+extern struct dentry * d_obtain_root(struct inode *);
 extern void shrink_dcache_sb(struct super_block *);
 extern void shrink_dcache_parent(struct dentry *);
 extern void shrink_dcache_for_umount(struct super_block *);
@@ -306,8 +315,7 @@ extern struct dentry *d_lookup(const struct dentry *, const struct qstr *);
 extern struct dentry *d_hash_and_lookup(struct dentry *, struct qstr *);
 extern struct dentry *__d_lookup(const struct dentry *, const struct qstr *);
 extern struct dentry *__d_lookup_rcu(const struct dentry *parent,
-				const struct qstr *name,
-				unsigned *seq, struct inode *inode);
+				const struct qstr *name, unsigned *seq);
 
 /**
  * __d_rcu_to_refcount - take a refcount on dentry if sequence check is ok
@@ -329,6 +337,11 @@ static inline int __d_rcu_to_refcount(struct dentry *dentry, unsigned seq)
 	}
 
 	return ret;
+}
+
+static inline unsigned d_count(struct dentry *dentry)
+{
+	return dentry->d_count;
 }
 
 /* validate "insecure" dentry pointer */
@@ -382,17 +395,17 @@ extern struct dentry *dget_parent(struct dentry *dentry);
  *	Returns true if the dentry passed is not currently hashed.
  */
  
-static inline int d_unhashed(struct dentry *dentry)
+static inline int d_unhashed(const struct dentry *dentry)
 {
 	return hlist_bl_unhashed(&dentry->d_hash);
 }
 
-static inline int d_unlinked(struct dentry *dentry)
+static inline int d_unlinked(const struct dentry *dentry)
 {
 	return d_unhashed(dentry) && !IS_ROOT(dentry);
 }
 
-static inline int cant_mount(struct dentry *dentry)
+static inline int cant_mount(const struct dentry *dentry)
 {
 	return (dentry->d_flags & DCACHE_CANT_MOUNT);
 }
@@ -406,24 +419,176 @@ static inline void dont_mount(struct dentry *dentry)
 
 extern void dput(struct dentry *);
 
-static inline bool d_managed(struct dentry *dentry)
+static inline bool d_managed(const struct dentry *dentry)
 {
 	return dentry->d_flags & DCACHE_MANAGED_DENTRY;
 }
 
-static inline bool d_mountpoint(struct dentry *dentry)
+static inline bool d_mountpoint(const struct dentry *dentry)
 {
 	return dentry->d_flags & DCACHE_MOUNTED;
 }
 
-static inline bool d_is_su(const struct dentry *dentry)
+/*
+ * Directory cache entry type accessor functions.
+ */
+static inline void __d_set_type(struct dentry *dentry, unsigned type)
 {
-	return dentry &&
-	       dentry->d_name.len == 2 &&
-	       !memcmp(dentry->d_name.name, "su", 2);
+	dentry->d_flags = (dentry->d_flags & ~DCACHE_ENTRY_TYPE) | type;
+}
+
+static inline void __d_clear_type(struct dentry *dentry)
+{
+	__d_set_type(dentry, DCACHE_MISS_TYPE);
+}
+
+static inline void d_set_type(struct dentry *dentry, unsigned type)
+{
+	spin_lock(&dentry->d_lock);
+	__d_set_type(dentry, type);
+	spin_unlock(&dentry->d_lock);
+}
+
+static inline unsigned __d_entry_type(const struct dentry *dentry)
+{
+	return dentry->d_flags & DCACHE_ENTRY_TYPE;
+}
+
+static inline bool d_can_lookup(const struct dentry *dentry)
+{
+	return __d_entry_type(dentry) == DCACHE_DIRECTORY_TYPE;
+}
+
+static inline bool d_is_autodir(const struct dentry *dentry)
+{
+	return __d_entry_type(dentry) == DCACHE_AUTODIR_TYPE;
+}
+
+static inline bool d_is_dir(const struct dentry *dentry)
+{
+	return d_can_lookup(dentry) || d_is_autodir(dentry);
+}
+
+static inline bool d_is_symlink(const struct dentry *dentry)
+{
+	return __d_entry_type(dentry) == DCACHE_SYMLINK_TYPE;
+}
+
+static inline bool d_is_file(const struct dentry *dentry)
+{
+	return __d_entry_type(dentry) == DCACHE_FILE_TYPE;
+}
+
+static inline bool d_is_negative(const struct dentry *dentry)
+{
+	return __d_entry_type(dentry) == DCACHE_MISS_TYPE;
+}
+
+static inline bool d_is_positive(const struct dentry *dentry)
+{
+	return !d_is_negative(dentry);
+}
+
+/**
+ * d_really_is_negative - Determine if a dentry is really negative (ignoring fallthroughs)
+ * @dentry: The dentry in question
+ *
+ * Returns true if the dentry represents either an absent name or a name that
+ * doesn't map to an inode (ie. ->d_inode is NULL).  The dentry could represent
+ * a true miss, a whiteout that isn't represented by a 0,0 chardev or a
+ * fallthrough marker in an opaque directory.
+ *
+ * Note!  (1) This should be used *only* by a filesystem to examine its own
+ * dentries.  It should not be used to look at some other filesystem's
+ * dentries.  (2) It should also be used in combination with d_inode() to get
+ * the inode.  (3) The dentry may have something attached to ->d_lower and the
+ * type field of the flags may be set to something other than miss or whiteout.
+ */
+static inline bool d_really_is_negative(const struct dentry *dentry)
+{
+	return dentry->d_inode == NULL;
+}
+
+/**
+ * d_really_is_positive - Determine if a dentry is really positive (ignoring fallthroughs)
+ * @dentry: The dentry in question
+ *
+ * Returns true if the dentry represents a name that maps to an inode
+ * (ie. ->d_inode is not NULL).  The dentry might still represent a whiteout if
+ * that is represented on medium as a 0,0 chardev.
+ *
+ * Note!  (1) This should be used *only* by a filesystem to examine its own
+ * dentries.  It should not be used to look at some other filesystem's
+ * dentries.  (2) It should also be used in combination with d_inode() to get
+ * the inode.
+ */
+static inline bool d_really_is_positive(const struct dentry *dentry)
+{
+	return dentry->d_inode != NULL;
 }
 
 extern int sysctl_vfs_cache_pressure;
+
+static inline unsigned long vfs_pressure_ratio(unsigned long val)
+{
+	return mult_frac(val, sysctl_vfs_cache_pressure, 100);
+}
+
+/**
+ * d_inode - Get the actual inode of this dentry
+ * @dentry: The dentry to query
+ *
+ * This is the helper normal filesystems should use to get at their own inodes
+ * in their own dentries and ignore the layering superimposed upon them.
+ */
+static inline struct inode *d_inode(const struct dentry *dentry)
+{
+	return dentry->d_inode;
+}
+
+/**
+ * d_inode_rcu - Get the actual inode of this dentry with ACCESS_ONCE()
+ * @dentry: The dentry to query
+ *
+ * This is the helper normal filesystems should use to get at their own inodes
+ * in their own dentries and ignore the layering superimposed upon them.
+ */
+static inline struct inode *d_inode_rcu(const struct dentry *dentry)
+{
+	return ACCESS_ONCE(dentry->d_inode);
+}
+
+/**
+ * d_backing_inode - Get upper or lower inode we should be using
+ * @upper: The upper layer
+ *
+ * This is the helper that should be used to get at the inode that will be used
+ * if this dentry were to be opened as a file.  The inode may be on the upper
+ * dentry or it may be on a lower dentry pinned by the upper.
+ *
+ * Normal filesystems should not use this to access their own inodes.
+ */
+static inline struct inode *d_backing_inode(const struct dentry *upper)
+{
+	struct inode *inode = upper->d_inode;
+
+	return inode;
+}
+
+/**
+ * d_backing_dentry - Get upper or lower dentry we should be using
+ * @upper: The upper layer
+ *
+ * This is the helper that should be used to get the dentry of the inode that
+ * will be used if this dentry were opened as a file.  It may be the upper
+ * dentry or it may be a lower dentry pinned by the upper.
+ *
+ * Normal filesystems should not use this to access their own dentries.
+ */
+static inline struct dentry *d_backing_dentry(struct dentry *upper)
+{
+	return upper;
+}
 
 struct name_snapshot {
 	const char *name;

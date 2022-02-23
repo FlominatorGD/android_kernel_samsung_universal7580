@@ -23,6 +23,7 @@
 #define TEMP_MINOR		131	/* Temperature Sensor */
 #define RTC_MINOR		135
 #define EFI_RTC_MINOR		136	/* EFI Time services */
+#define VHCI_MINOR		137
 #define SUN_OPENPROM_MINOR	139
 #define DMAPI_MINOR		140	/* DMAPI */
 #define NVRAM_MINOR		144
@@ -31,6 +32,7 @@
 #define I2O_MINOR		166
 #define MICROCODE_MINOR		184
 #define TUN_MINOR		200
+#define CUSE_MINOR		203
 #define MWAVE_MINOR		219	/* ACP/Mwave Modem */
 #define MPT_MINOR		220
 #define MPT2SAS_MINOR		221

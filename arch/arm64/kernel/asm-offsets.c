@@ -23,7 +23,6 @@
 #include <linux/dma-mapping.h>
 #include <asm/thread_info.h>
 #include <asm/memory.h>
-#include <asm/cputable.h>
 #include <asm/smp_plat.h>
 #include <asm/suspend.h>
 #include <asm/vdso_datapage.h>
@@ -59,6 +58,7 @@ int main(void)
   DEFINE(S_PC,			offsetof(struct pt_regs, pc));
   DEFINE(S_ORIG_X0,		offsetof(struct pt_regs, orig_x0));
   DEFINE(S_SYSCALLNO,		offsetof(struct pt_regs, syscallno));
+  DEFINE(S_ORIG_ADDR_LIMIT,	offsetof(struct pt_regs, orig_addr_limit));
   DEFINE(S_FRAME_SIZE,		sizeof(struct pt_regs));
   BLANK();
   DEFINE(MM_CONTEXT_ID,		offsetof(struct mm_struct, context.id));
@@ -69,9 +69,6 @@ int main(void)
   DEFINE(VM_EXEC,	       	VM_EXEC);
   BLANK();
   DEFINE(PAGE_SZ,	       	PAGE_SIZE);
-  BLANK();
-  DEFINE(CPU_INFO_SZ,		sizeof(struct cpu_info));
-  DEFINE(CPU_INFO_SETUP,	offsetof(struct cpu_info, cpu_setup));
   BLANK();
   DEFINE(DMA_BIDIRECTIONAL,	DMA_BIDIRECTIONAL);
   DEFINE(DMA_TO_DEVICE,		DMA_TO_DEVICE);

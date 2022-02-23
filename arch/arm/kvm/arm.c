@@ -66,7 +66,7 @@ static bool vgic_present;
 static void kvm_arm_set_running_vcpu(struct kvm_vcpu *vcpu)
 {
 	BUG_ON(preemptible());
-	__get_cpu_var(kvm_arm_running_vcpu) = vcpu;
+	__this_cpu_write(kvm_arm_running_vcpu, vcpu);
 }
 
 /**
@@ -76,7 +76,7 @@ static void kvm_arm_set_running_vcpu(struct kvm_vcpu *vcpu)
 struct kvm_vcpu *kvm_arm_get_running_vcpu(void)
 {
 	BUG_ON(preemptible());
-	return __get_cpu_var(kvm_arm_running_vcpu);
+	return __this_cpu_read(kvm_arm_running_vcpu);
 }
 
 /**
@@ -801,8 +801,8 @@ long kvm_arch_vm_ioctl(struct file *filp,
 
 static void cpu_init_hyp_mode(void *dummy)
 {
-	unsigned long long boot_pgd_ptr;
-	unsigned long long pgd_ptr;
+	phys_addr_t boot_pgd_ptr;
+	phys_addr_t pgd_ptr;
 	unsigned long hyp_stack_ptr;
 	unsigned long stack_page;
 	unsigned long vector_ptr;
@@ -810,9 +810,9 @@ static void cpu_init_hyp_mode(void *dummy)
 	/* Switch from the HYP stub to our own HYP init vector */
 	__hyp_set_vectors(kvm_get_idmap_vector());
 
-	boot_pgd_ptr = (unsigned long long)kvm_mmu_get_boot_httbr();
-	pgd_ptr = (unsigned long long)kvm_mmu_get_httbr();
-	stack_page = __get_cpu_var(kvm_arm_hyp_stack_page);
+	boot_pgd_ptr = kvm_mmu_get_boot_httbr();
+	pgd_ptr = kvm_mmu_get_httbr();
+	stack_page = __this_cpu_read(kvm_arm_hyp_stack_page);
 	hyp_stack_ptr = stack_page + PAGE_SIZE;
 	vector_ptr = (unsigned long)__kvm_hyp_vector;
 

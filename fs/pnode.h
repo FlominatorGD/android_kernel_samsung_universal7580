@@ -16,6 +16,9 @@
 #define IS_MNT_NEW(m)  (!(m)->mnt_ns)
 #define CLEAR_MNT_SHARED(m) ((m)->mnt.mnt_flags &= ~MNT_SHARED)
 #define IS_MNT_UNBINDABLE(m) ((m)->mnt.mnt_flags & MNT_UNBINDABLE)
+#define IS_MNT_MARKED(m) ((m)->mnt.mnt_flags & MNT_MARKED)
+#define SET_MNT_MARK(m) ((m)->mnt.mnt_flags |= MNT_MARKED)
+#define CLEAR_MNT_MARK(m) ((m)->mnt.mnt_flags &= ~MNT_MARKED)
 
 #define CL_EXPIRE    		0x01
 #define CL_SLAVE     		0x02
@@ -46,4 +49,5 @@ void umount_tree(struct mount *, int);
 struct mount *copy_tree(struct mount *, struct dentry *, int);
 bool is_path_reachable(struct mount *, struct dentry *,
 			 const struct path *root);
+int count_mounts(struct mnt_namespace *ns, struct mount *mnt);
 #endif /* _LINUX_PNODE_H */

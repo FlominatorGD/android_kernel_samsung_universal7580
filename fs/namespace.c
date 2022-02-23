@@ -26,6 +26,9 @@
 #include "pnode.h"
 #include "internal.h"
 
+/* Maximum number of mounts in a mount namespace */
+unsigned int sysctl_mount_max __read_mostly = 100000;
+
 #define HASH_SHIFT ilog2(PAGE_SIZE / sizeof(struct list_head))
 #define HASH_SIZE (1UL << HASH_SHIFT)
 
@@ -746,6 +749,10 @@ static void commit_tree(struct mount *mnt)
 	list_add_tail(&mnt->mnt_hash, mount_hashtable +
 				hash(&parent->mnt, mnt->mnt_mountpoint));
 	list_add_tail(&mnt->mnt_child, &parent->mnt_mounts);
+
+	n->mounts += n->pending_mounts;
+	n->pending_mounts = 0;
+
 	touch_mnt_namespace(n);
 }
 
@@ -848,7 +855,7 @@ static struct mount *clone_mnt(struct mount *old, struct dentry *root,
 			goto out_free;
 	}
 
-	mnt->mnt.mnt_flags = old->mnt.mnt_flags & ~MNT_WRITE_HOLD;
+	mnt->mnt.mnt_flags = old->mnt.mnt_flags & ~(MNT_WRITE_HOLD|MNT_MARKED);
 	/* Don't allow unprivileged users to change mount flags */
 	if (flag & CL_UNPRIVILEGED) {
 		mnt->mnt.mnt_flags |= MNT_LOCK_ATIME;
@@ -1217,9 +1224,14 @@ void umount_tree(struct mount *mnt, int propagate)
 		propagate_umount(&tmp_list);
 
 	list_for_each_entry(p, &tmp_list, mnt_hash) {
+		struct mnt_namespace *ns;
 		list_del_init(&p->mnt_expire);
 		list_del_init(&p->mnt_list);
-		__touch_mnt_namespace(p->mnt_ns);
+		ns = p->mnt_ns;
+		if (ns) {
+			ns->mounts--;
+			__touch_mnt_namespace(ns);
+		}
 		p->mnt_ns = NULL;
 		list_del_init(&p->mnt_child);
 		if (mnt_has_parent(p)) {
@@ -1356,7 +1368,7 @@ SYSCALL_DEFINE2(umount, char __user *, name, int, flags)
 	if (!(flags & UMOUNT_NOFOLLOW))
 		lookup_flags |= LOOKUP_FOLLOW;
 
-	retval = user_path_at(AT_FDCWD, name, lookup_flags, &path);
+	retval = user_path_mountpoint_at(AT_FDCWD, name, lookup_flags, &path);
 	if (retval)
 		goto out;
 	mnt = real_mount(path.mnt);
@@ -1528,6 +1540,28 @@ static int invent_group_ids(struct mount *mnt, bool recurse)
 	return 0;
 }
 
+int count_mounts(struct mnt_namespace *ns, struct mount *mnt)
+{
+	unsigned int max = READ_ONCE(sysctl_mount_max);
+	unsigned int mounts = 0, old, pending, sum;
+	struct mount *p;
+
+	for (p = mnt; p; p = next_mnt(p, mnt))
+		mounts++;
+
+	old = ns->mounts;
+	pending = ns->pending_mounts;
+	sum = old + pending;
+	if ((old > sum) ||
+	    (pending > sum) ||
+	    (max < sum) ||
+	    (mounts > (max - sum)))
+		return -ENOSPC;
+
+	ns->pending_mounts = pending + mounts;
+	return 0;
+}
+
 /*
  *  @source_mnt : mount tree to be attached
  *  @nd         : place the mount tree @source_mnt is attached
@@ -1597,23 +1631,29 @@ static int attach_recursive_mnt(struct mount *source_mnt,
 			struct path *parent_path)
 {
 	LIST_HEAD(tree_list);
+	struct mnt_namespace *ns = dest_mnt->mnt_ns;
 	struct mount *child, *p;
 	int err;
+
+	/* Is there space to add these mounts to the mount namespace? */
+	if (!parent_path) {
+		err = count_mounts(ns, source_mnt);
+		if (err)
+			goto out;
+	}
 
 	if (IS_MNT_SHARED(dest_mnt)) {
 		err = invent_group_ids(source_mnt, true);
 		if (err)
 			goto out;
-	}
-	err = propagate_mnt(dest_mnt, dest_mp, source_mnt, &tree_list);
-	if (err)
-		goto out_cleanup_ids;
-
-	br_write_lock(&vfsmount_lock);
-
-	if (IS_MNT_SHARED(dest_mnt)) {
+		err = propagate_mnt(dest_mnt, dest_mp, source_mnt, &tree_list);
+		br_write_lock(&vfsmount_lock);
+		if (err)
+			goto out_cleanup_ids;
 		for (p = source_mnt; p; p = next_mnt(p, source_mnt))
 			set_mnt_shared(p);
+	} else {
+		br_write_lock(&vfsmount_lock);
 	}
 	if (parent_path) {
 		detach_mnt(source_mnt, parent_path);
@@ -1633,9 +1673,15 @@ static int attach_recursive_mnt(struct mount *source_mnt,
 	return 0;
 
  out_cleanup_ids:
-	if (IS_MNT_SHARED(dest_mnt))
-		cleanup_group_ids(source_mnt, NULL);
+	while (!list_empty(&tree_list)) {
+		child = list_first_entry(&tree_list, struct mount, mnt_hash);
+		child->mnt_parent->mnt_ns->pending_mounts = 0;
+		umount_tree(child, 0);
+	}
+	br_write_unlock(&vfsmount_lock);
+	cleanup_group_ids(source_mnt, NULL);
  out:
+	ns->pending_mounts = 0;
 	return err;
 }
 
@@ -2007,7 +2053,7 @@ static int do_add_mount(struct mount *newmnt, struct path *path, int mnt_flags)
 	struct mount *parent;
 	int err;
 
-	mnt_flags &= ~(MNT_SHARED | MNT_WRITE_HOLD | MNT_INTERNAL);
+	mnt_flags &= ~MNT_INTERNAL_FLAGS;
 
 	mp = lock_mount(path);
 	if (IS_ERR(mp))
@@ -2307,21 +2353,9 @@ int copy_mount_options(const void __user * data, unsigned long *where)
 	return 0;
 }
 
-int copy_mount_string(const void __user *data, char **where)
+char *copy_mount_string(const void __user *data)
 {
-	char *tmp;
-
-	if (!data) {
-		*where = NULL;
-		return 0;
-	}
-
-	tmp = strndup_user(data, PAGE_SIZE);
-	if (IS_ERR(tmp))
-		return PTR_ERR(tmp);
-
-	*where = tmp;
-	return 0;
+	return data ? strndup_user(data, PAGE_SIZE) : NULL;
 }
 
 /*
@@ -2338,7 +2372,7 @@ int copy_mount_string(const void __user *data, char **where)
  * Therefore, if this magic number is present, it carries no information
  * and must be discarded.
  */
-long do_mount(const char *dev_name, const char *dir_name,
+long do_mount(const char *dev_name, const char __user *dir_name,
 		const char *type_page, unsigned long flags, void *data_page)
 {
 	struct path path;
@@ -2350,15 +2384,11 @@ long do_mount(const char *dev_name, const char *dir_name,
 		flags &= ~MS_MGC_MSK;
 
 	/* Basic sanity checks */
-
-	if (!dir_name || !*dir_name || !memchr(dir_name, 0, PAGE_SIZE))
-		return -EINVAL;
-
 	if (data_page)
 		((char *)data_page)[PAGE_SIZE - 1] = 0;
 
 	/* ... and get the mountpoint */
-	retval = kern_path(dir_name, LOOKUP_FOLLOW, &path);
+	retval = user_path(dir_name, &path);
 	if (retval)
 		return retval;
 
@@ -2454,6 +2484,8 @@ static struct mnt_namespace *alloc_mnt_ns(struct user_namespace *user_ns)
 	init_waitqueue_head(&new_ns->poll);
 	new_ns->event = 0;
 	new_ns->user_ns = get_user_ns(user_ns);
+	new_ns->mounts = 0;
+	new_ns->pending_mounts = 0;
 	return new_ns;
 }
 
@@ -2500,6 +2532,7 @@ static struct mnt_namespace *dup_mnt_ns(struct mnt_namespace *mnt_ns,
 	q = new;
 	while (p) {
 		q->mnt_ns = new_ns;
+		new_ns->mounts++;
 		if (fs) {
 			if (&p->mnt == fs->root.mnt) {
 				fs->root.mnt = mntget(&q->mnt);
@@ -2551,6 +2584,7 @@ static struct mnt_namespace *create_mnt_ns(struct vfsmount *m)
 		struct mount *mnt = real_mount(m);
 		mnt->mnt_ns = new_ns;
 		new_ns->root = mnt;
+		new_ns->mounts++;
 		list_add(&mnt->mnt_list, &new_ns->list);
 	} else {
 		mntput(m);
@@ -2593,37 +2627,30 @@ SYSCALL_DEFINE5(mount, char __user *, dev_name, char __user *, dir_name,
 {
 	int ret;
 	char *kernel_type;
-	struct filename *kernel_dir;
 	char *kernel_dev;
 	unsigned long data_page;
 
-	ret = copy_mount_string(type, &kernel_type);
-	if (ret < 0)
+	kernel_type = copy_mount_string(type);
+	ret = PTR_ERR(kernel_type);
+	if (IS_ERR(kernel_type))
 		goto out_type;
 
-	kernel_dir = getname(dir_name);
-	if (IS_ERR(kernel_dir)) {
-		ret = PTR_ERR(kernel_dir);
-		goto out_dir;
-	}
-
-	ret = copy_mount_string(dev_name, &kernel_dev);
-	if (ret < 0)
+	kernel_dev = copy_mount_string(dev_name);
+	ret = PTR_ERR(kernel_dev);
+	if (IS_ERR(kernel_dev))
 		goto out_dev;
 
 	ret = copy_mount_options(data, &data_page);
 	if (ret < 0)
 		goto out_data;
 
-	ret = do_mount(kernel_dev, kernel_dir->name, kernel_type, flags,
+	ret = do_mount(kernel_dev, dir_name, kernel_type, flags,
 		(void *) data_page);
 
 	free_page(data_page);
 out_data:
 	kfree(kernel_dev);
 out_dev:
-	putname(kernel_dir);
-out_dir:
 	kfree(kernel_type);
 out_type:
 	return ret;
@@ -2740,8 +2767,8 @@ SYSCALL_DEFINE2(pivot_root, const char __user *, new_root,
 	/* make certain new is below the root */
 	if (!is_path_reachable(new_mnt, new.dentry, &root))
 		goto out4;
-	root_mp->m_count++; /* pin it so it won't go away */
 	br_write_lock(&vfsmount_lock);
+	root_mp->m_count++; /* pin it so it won't go away */
 	detach_mnt(new_mnt, &parent_path);
 	detach_mnt(root_mnt, &root_parent);
 	/* mount old root on put_old */
@@ -2928,13 +2955,13 @@ static void *mntns_get(struct task_struct *task)
 	struct mnt_namespace *ns = NULL;
 	struct nsproxy *nsproxy;
 
-	rcu_read_lock();
-	nsproxy = task_nsproxy(task);
+	task_lock(task);
+	nsproxy = task->nsproxy;
 	if (nsproxy) {
 		ns = nsproxy->mnt_ns;
 		get_mnt_ns(ns);
 	}
-	rcu_read_unlock();
+	task_unlock(task);
 
 	return ns;
 }

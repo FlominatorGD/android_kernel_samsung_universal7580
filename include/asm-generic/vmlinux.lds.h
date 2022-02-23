@@ -40,6 +40,8 @@
  * }
  *
  * [__init_begin, __init_end] is the init section that may be freed after init
+ * 	// __init_begin and __init_end should be page aligned, so that we can
+ *	// free the whole .init memory
  * [_stext, _etext] is the text section
  * [_sdata, _edata] is the data section
  *
@@ -130,8 +132,12 @@
 #define TRACE_PRINTKS() VMLINUX_SYMBOL(__start___trace_bprintk_fmt) = .;      \
 			 *(__trace_printk_fmt) /* Trace_printk fmt' pointer */ \
 			 VMLINUX_SYMBOL(__stop___trace_bprintk_fmt) = .;
+#define TRACEPOINT_STR() VMLINUX_SYMBOL(__start___tracepoint_str) = .;	\
+			 *(__tracepoint_str) /* Trace_printk fmt' pointer */ \
+			 VMLINUX_SYMBOL(__stop___tracepoint_str) = .;
 #else
 #define TRACE_PRINTKS()
+#define TRACEPOINT_STR()
 #endif
 
 #ifdef CONFIG_FTRACE_SYSCALLS
@@ -222,7 +228,8 @@
 	VMLINUX_SYMBOL(__stop___verbose) = .;				\
 	LIKELY_PROFILE()		       				\
 	BRANCH_PROFILE()						\
-	TRACE_PRINTKS()
+	TRACE_PRINTKS()							\
+	TRACEPOINT_STR()
 
 /*
  * Data section helpers
@@ -678,30 +685,6 @@
 		*(.initcall##level##.init)				\
 		*(.initcall##level##s.init)				\
 
-#ifdef CONFIG_DEFERRED_INITCALLS
-#define DEFERRED_INITCALLS(level)						\
-		VMLINUX_SYMBOL(__deferred_initcall_start) = .;		\
-		*(.deferred_initcall##level##.init)				\
-		*(.deferred_initcall##level##s.init)				\
-		VMLINUX_SYMBOL(__deferred_initcall_end) = .;
-#endif
-
-#ifdef CONFIG_DEFERRED_INITCALLS
-#define INIT_CALLS							\
-		VMLINUX_SYMBOL(__initcall_start) = .;			\
-		*(.initcallearly.init)					\
-		INIT_CALLS_LEVEL(0)					\
-		INIT_CALLS_LEVEL(1)					\
-		INIT_CALLS_LEVEL(2)					\
-		INIT_CALLS_LEVEL(3)					\
-		INIT_CALLS_LEVEL(4)					\
-		INIT_CALLS_LEVEL(5)					\
-		INIT_CALLS_LEVEL(rootfs)				\
-		INIT_CALLS_LEVEL(6)					\
-		INIT_CALLS_LEVEL(7)					\
-		VMLINUX_SYMBOL(__initcall_end) = .;	\
-		DEFERRED_INITCALLS(0)
-#else
 #define INIT_CALLS							\
 		VMLINUX_SYMBOL(__initcall_start) = .;			\
 		*(.initcallearly.init)					\
@@ -715,7 +698,6 @@
 		INIT_CALLS_LEVEL(6)					\
 		INIT_CALLS_LEVEL(7)					\
 		VMLINUX_SYMBOL(__initcall_end) = .;
-#endif
 
 #define CON_INITCALL							\
 		VMLINUX_SYMBOL(__con_initcall_start) = .;		\
@@ -772,7 +754,7 @@
 	. = ALIGN(PAGE_SIZE);						\
 	*(.data..percpu..page_aligned)					\
 	. = ALIGN(cacheline);						\
-	*(.data..percpu..readmostly)					\
+	*(.data..percpu..read_mostly)					\
 	. = ALIGN(cacheline);						\
 	*(.data..percpu)						\
 	*(.data..percpu..shared_aligned)				\

@@ -127,8 +127,7 @@ static int __init snd_hrtimer_init(void)
 
 	hrtimer_get_res(CLOCK_MONOTONIC, &tp);
 	if (tp.tv_sec > 0 || !tp.tv_nsec) {
-		snd_printk(KERN_ERR
-			   "snd-hrtimer: Invalid resolution %u.%09u",
+		pr_err("snd-hrtimer: Invalid resolution %u.%09u",
 			   (unsigned)tp.tv_sec, (unsigned)tp.tv_nsec);
 		return -EINVAL;
 	}
@@ -145,6 +144,7 @@ static int __init snd_hrtimer_init(void)
 	timer->hw = hrtimer_hw;
 	timer->hw.resolution = resolution;
 	timer->hw.ticks = NANO_SEC / resolution;
+	timer->max_instances = 100; /* lower the limit */
 
 	err = snd_timer_global_register(timer);
 	if (err < 0) {

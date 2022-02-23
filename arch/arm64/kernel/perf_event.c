@@ -1101,7 +1101,7 @@ static irqreturn_t armv8pmu_handle_irq(int irq_num, void *dev)
 	 */
 	regs = get_irq_regs();
 
-	cpuc = &__get_cpu_var(cpu_hw_events);
+	cpuc = this_cpu_ptr(&cpu_hw_events);
 	for (idx = 0; idx < cpu_pmu->num_events; ++idx) {
 		struct perf_event *event = cpuc->events[idx];
 		struct hw_perf_event *hwc;
@@ -1224,9 +1224,6 @@ static void armv8pmu_reset(void *info)
 
 	/* Initialize & Reset PMNC: C and P bits. */
 	armv8pmu_pmcr_write(ARMV8_PMCR_P | ARMV8_PMCR_C);
-
-	/* Disable access from userspace. */
-	asm volatile("msr pmuserenr_el0, %0" :: "r" (0));
 }
 
 static int armv8_pmuv3_map_event(struct perf_event *event)
@@ -1314,7 +1311,7 @@ device_initcall(register_pmu_driver);
 
 static struct pmu_hw_events *armpmu_get_cpu_events(void)
 {
-	return &__get_cpu_var(cpu_hw_events);
+	return this_cpu_ptr(&cpu_hw_events);
 }
 
 static void __init cpu_pmu_init(struct arm_pmu *armpmu)
@@ -1331,9 +1328,9 @@ static void __init cpu_pmu_init(struct arm_pmu *armpmu)
 
 static int __init init_hw_perf_events(void)
 {
-	u64 dfr = read_cpuid(ID_AA64DFR0_EL1);
+	u64 dfr = read_system_reg(SYS_ID_AA64DFR0_EL1);
 
-	switch ((dfr >> 8) & 0xf) {
+	switch (cpuid_feature_extract_field(dfr, ID_AA64DFR0_PMUVER_SHIFT)) {
 	case 0x1:	/* PMUv3 */
 		cpu_pmu = armv8_pmuv3_pmu_init();
 		break;

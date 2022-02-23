@@ -270,38 +270,21 @@ static inline unsigned long __sdfat_init_name_hash(const struct dentry *unused)
 }
 #endif
 
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 21)
-       /* EMPTY */
-#else /* LINUX_VERSION_CODE < KERNEL_VERSION(4, 4, 21) */
-static inline void inode_lock(struct inode *inode)
-{
-	       mutex_lock(&inode->i_mutex);
-}
-
-static inline void inode_unlock(struct inode *inode)
-{
-	       mutex_unlock(&inode->i_mutex);
-}
-#endif
-
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 16, 0)
 static inline int sdfat_remount_syncfs(struct super_block *sb)
 {
 	sync_filesystem(sb);
 	return 0;
 }
-#else /* LINUX_VERSION_CODE < KERNEL_VERSION(3, 16, 0) */
-static inline int sdfat_remount_syncfs(struct super_block *sb)
+
+static int sdfat_d_hash(const struct dentry *dentry, struct qstr *qstr)
 {
-	/*
-	 * We don`t need to call sync_filesystem(sb),
-	 * Because VFS calls it.
-	 */
-	return 0;
+	return __sdfat_d_hash(dentry, qstr);
 }
-#endif
+
+static int sdfat_d_hashi(const struct dentry *dentry, struct qstr *qstr)
+{
+	return __sdfat_d_hashi(dentry, qstr);
+}
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0)
 static inline sector_t __sdfat_bio_sector(struct bio *bio)
@@ -324,16 +307,6 @@ static void __sdfat_truncate_pagecache(struct inode *inode,
 					loff_t to, loff_t newsize)
 {
 	truncate_pagecache(inode, newsize);
-}
-
-static int sdfat_d_hash(const struct dentry *dentry, struct qstr *qstr)
-{
-	return __sdfat_d_hash(dentry, qstr);
-}
-
-static int sdfat_d_hashi(const struct dentry *dentry, struct qstr *qstr)
-{
-	return __sdfat_d_hashi(dentry, qstr);
 }
 
 //instead of sdfat_readdir
@@ -456,19 +429,7 @@ static inline void __sdfat_set_bio_iterate(struct bio *bio, sector_t sector,
 static void __sdfat_truncate_pagecache(struct inode *inode,
 					loff_t to, loff_t newsize)
 {
-	truncate_pagecache(inode, to, newsize);
-}
-
-static int sdfat_d_hash(const struct dentry *dentry,
-		const struct inode *inode, struct qstr *qstr)
-{
-	return __sdfat_d_hash(dentry, qstr);
-}
-
-static int sdfat_d_hashi(const struct dentry *dentry,
-		const struct inode *inode, struct qstr *qstr)
-{
-	return __sdfat_d_hashi(dentry, qstr);
+	truncate_pagecache(inode, newsize);
 }
 
 static int sdfat_readdir(struct file *filp, void *dirent, filldir_t filldir)
@@ -949,7 +910,7 @@ static int sdfat_cmpi(const struct dentry *dentry,
 {
 	return __sdfat_cmpi(dentry, len, str, name);
 }
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0)
+#else
 static int sdfat_cmp(const struct dentry *parent, const struct dentry *dentry,
 		unsigned int len, const char *str, const struct qstr *name)
 {
@@ -957,20 +918,6 @@ static int sdfat_cmp(const struct dentry *parent, const struct dentry *dentry,
 }
 
 static int sdfat_cmpi(const struct dentry *parent, const struct dentry *dentry,
-		unsigned int len, const char *str, const struct qstr *name)
-{
-	return __sdfat_cmpi(dentry, len, str, name);
-}
-#else
-static int sdfat_cmp(const struct dentry *parent, const struct inode *pinode,
-		const struct dentry *dentry, const struct inode *inode,
-		unsigned int len, const char *str, const struct qstr *name)
-{
-	return __sdfat_cmp(dentry, len, str, name);
-}
-
-static int sdfat_cmpi(const struct dentry *parent, const struct inode *pinode,
-		const struct dentry *dentry, const struct inode *inode,
 		unsigned int len, const char *str, const struct qstr *name)
 {
 	return __sdfat_cmpi(dentry, len, str, name);
@@ -2512,11 +2459,7 @@ static struct dentry *__sdfat_lookup(struct inode *dir, struct dentry *dentry)
 		 * In such case, we reuse an alias instead of new dentry
 		 */
 		if (d_unhashed(alias)) {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 10, 0)
-			BUG_ON(alias->d_name.hash != dentry->d_name.hash && alias->d_name.len != dentry->d_name.len);
-#else
 			BUG_ON(alias->d_name.hash_len != dentry->d_name.hash_len);
-#endif
 			sdfat_msg(sb, KERN_INFO, "rehashed a dentry(%p) "
 				"in read lookup", alias);
 			d_drop(dentry);
@@ -5190,7 +5133,6 @@ static struct file_system_type sdfat_fs_type = {
 #endif /* CONFIG_SDFAT_DBG_IOCTL */
 	.fs_flags    = FS_REQUIRES_DEV,
 };
-MODULE_ALIAS_FS("sdfat");
 
 #ifdef CONFIG_SDFAT_USE_FOR_EXFAT
 static struct file_system_type exfat_fs_type = {
@@ -5204,7 +5146,6 @@ static struct file_system_type exfat_fs_type = {
 #endif /* CONFIG_SDFAT_DBG_IOCTL */
 	.fs_flags    = FS_REQUIRES_DEV,
 };
-MODULE_ALIAS_FS("exfat");
 #endif /* CONFIG_SDFAT_USE_FOR_EXFAT */
 
 #ifdef CONFIG_SDFAT_USE_FOR_VFAT
@@ -5219,7 +5160,6 @@ static struct file_system_type vfat_fs_type = {
 #endif /* CONFIG_SDFAT_DBG_IOCTL */
 	.fs_flags    = FS_REQUIRES_DEV,
 };
-MODULE_ALIAS_FS("vfat");
 #endif /* CONFIG_SDFAT_USE_FOR_VFAT */
 
 static int __init init_sdfat_fs(void)

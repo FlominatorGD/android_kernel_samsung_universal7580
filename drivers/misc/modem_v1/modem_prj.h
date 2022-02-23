@@ -37,7 +37,7 @@
 #include "include/circ_queue.h"
 #include "include/sipc5.h"
 
-#define DEBUG_MODEM_IF
+/* #define DEBUG_MODEM_IF */
 #ifdef DEBUG_MODEM_IF
 #if 1
 #define DEBUG_MODEM_IF_LINK_TX
@@ -268,7 +268,7 @@ enum iod_rx_state {
 	MAX_IOD_RX_STATE
 };
 
-static const char const *rx_state_string[] = {
+static const char *rx_state_string[] = {
 	[IOD_RX_ON_STANDBY]	= "RX_ON_STANDBY",
 	[IOD_RX_HEADER]		= "RX_HEADER",
 	[IOD_RX_PAYLOAD]	= "RX_PAYLOAD",

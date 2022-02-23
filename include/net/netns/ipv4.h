@@ -7,6 +7,7 @@
 
 #include <linux/uidgid.h>
 #include <net/inet_frag.h>
+#include <linux/siphash.h>
 
 struct tcpm_hash_bucket;
 struct ctl_table_header;
@@ -67,6 +68,7 @@ struct netns_ipv4 {
 
 	int sysctl_fwmark_reflect;
 	int sysctl_tcp_fwmark_accept;
+	int sysctl_tcp_min_snd_mss;
 
 	kgid_t sysctl_ping_group_range[2];
 	long sysctl_tcp_mem[3];
@@ -81,5 +83,6 @@ struct netns_ipv4 {
 	struct fib_rules_ops	*mr_rules_ops;
 #endif
 #endif
+	siphash_key_t	ip_id_key;
 };
 #endif

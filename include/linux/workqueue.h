@@ -56,9 +56,8 @@ enum {
 	WORK_NR_COLORS		= (1 << WORK_STRUCT_COLOR_BITS) - 1,
 	WORK_NO_COLOR		= WORK_NR_COLORS,
 
-	/* special cpu IDs */
+	/* not bound to any CPU, prefer the local CPU */
 	WORK_CPU_UNBOUND	= NR_CPUS,
-	WORK_CPU_END		= NR_CPUS + 1,
 
 	/*
 	 * Reserve 7 bits off of pwq pointer w/ debugobjects turned off.
@@ -284,13 +283,6 @@ static inline unsigned int work_static(struct work_struct *work) { return 0; }
 #define delayed_work_pending(w) \
 	work_pending(&(w)->work)
 
-/**
- * work_clear_pending - for internal use only, mark a work item as not pending
- * @work: The work item in question
- */
-#define work_clear_pending(work) \
-	clear_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work))
-
 /*
  * Workqueue flags and constants.  For details, please refer to
  * Documentation/workqueue.txt.
@@ -352,6 +344,9 @@ enum {
  * short queue flush time.  Don't queue works which can run for too
  * long.
  *
+ * system_highpri_wq is similar to system_wq but for work items which
+ * require WQ_HIGHPRI.
+ *
  * system_long_wq is similar to system_wq but may host long running
  * works.  Queue flushing might take relatively long.
  *
@@ -370,6 +365,7 @@ enum {
  * 'wq_power_efficient' is disabled.  See WQ_POWER_EFFICIENT for more info.
  */
 extern struct workqueue_struct *system_wq;
+extern struct workqueue_struct *system_highpri_wq;
 extern struct workqueue_struct *system_long_wq;
 extern struct workqueue_struct *system_unbound_wq;
 extern struct workqueue_struct *system_freezable_wq;
@@ -416,10 +412,7 @@ __alloc_workqueue_key(const char *fmt, unsigned int flags, int max_active,
 	static struct lock_class_key __key;				\
 	const char *__lock_name;					\
 									\
-	if (__builtin_constant_p(fmt))					\
-		__lock_name = (fmt);					\
-	else								\
-		__lock_name = #fmt;					\
+	__lock_name = #fmt#args;					\
 									\
 	__alloc_workqueue_key((fmt), (flags), (max_active),		\
 			      &__key, __lock_name, ##args);		\
@@ -448,9 +441,10 @@ __alloc_workqueue_key(const char *fmt, unsigned int flags, int max_active,
 			__WQ_ORDERED_EXPLICIT | (flags), 1, ##args)
 
 #define create_workqueue(name)						\
-	alloc_workqueue((name), WQ_MEM_RECLAIM, 1)
+	alloc_workqueue("%s", WQ_MEM_RECLAIM, 1, (name))
 #define create_freezable_workqueue(name)				\
-	alloc_workqueue((name), WQ_FREEZABLE | WQ_UNBOUND | WQ_MEM_RECLAIM, 1)
+	alloc_workqueue("%s", WQ_FREEZABLE | WQ_UNBOUND | WQ_MEM_RECLAIM, \
+			1, (name))
 #define create_singlethread_workqueue(name)				\
 	alloc_ordered_workqueue("%s", WQ_MEM_RECLAIM, name)
 
@@ -600,21 +594,6 @@ static inline bool schedule_delayed_work(struct delayed_work *dwork,
 static inline bool keventd_up(void)
 {
 	return system_wq != NULL;
-}
-
-/*
- * Like above, but uses del_timer() instead of del_timer_sync(). This means,
- * if it returns 0 the timer function may be running and the queueing is in
- * progress.
- */
-static inline bool __deprecated __cancel_delayed_work(struct delayed_work *work)
-{
-	bool ret;
-
-	ret = del_timer(&work->timer);
-	if (ret)
-		work_clear_pending(&work->work);
-	return ret;
 }
 
 /* used to be different but now identical to flush_work(), deprecated */

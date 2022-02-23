@@ -330,8 +330,10 @@ static void rawv6_err(struct sock *sk, struct sk_buff *skb,
 		ip6_sk_update_pmtu(skb, sk, info);
 		harderr = (np->pmtudisc == IPV6_PMTUDISC_DO);
 	}
-	if (type == NDISC_REDIRECT)
+	if (type == NDISC_REDIRECT) {
 		ip6_sk_redirect(skb, sk);
+		return;
+	}
 	if (np->recverr) {
 		u8 *payload = skb->data;
 		if (!inet->hdrincl)
@@ -482,7 +484,7 @@ static int rawv6_recvmsg(struct kiocb *iocb, struct sock *sk,
 			goto csum_copy_err;
 		err = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
 	} else {
-		err = skb_copy_and_csum_datagram_iovec(skb, 0, msg->msg_iov, copied);
+		err = skb_copy_and_csum_datagram_iovec(skb, 0, msg->msg_iov);
 		if (err == -EINVAL)
 			goto csum_copy_err;
 	}
@@ -1234,45 +1236,16 @@ struct proto rawv6_prot = {
 };
 
 #ifdef CONFIG_PROC_FS
-static void raw6_sock_seq_show(struct seq_file *seq, struct sock *sp, int i)
-{
-	struct ipv6_pinfo *np = inet6_sk(sp);
-	const struct in6_addr *dest, *src;
-	__u16 destp, srcp;
-
-	dest  = &np->daddr;
-	src   = &np->rcv_saddr;
-	destp = 0;
-	srcp  = inet_sk(sp)->inet_num;
-	seq_printf(seq,
-		   "%4d: %08X%08X%08X%08X:%04X %08X%08X%08X%08X:%04X "
-		   "%02X %08X:%08X %02X:%08lX %08X %5d %8d %lu %d %pK %d\n",
-		   i,
-		   src->s6_addr32[0], src->s6_addr32[1],
-		   src->s6_addr32[2], src->s6_addr32[3], srcp,
-		   dest->s6_addr32[0], dest->s6_addr32[1],
-		   dest->s6_addr32[2], dest->s6_addr32[3], destp,
-		   sp->sk_state,
-		   sk_wmem_alloc_get(sp),
-		   sk_rmem_alloc_get(sp),
-		   0, 0L, 0,
-		   from_kuid_munged(seq_user_ns(seq), sock_i_uid(sp)),
-		   0,
-		   sock_i_ino(sp),
-		   atomic_read(&sp->sk_refcnt), sp, atomic_read(&sp->sk_drops));
-}
-
 static int raw6_seq_show(struct seq_file *seq, void *v)
 {
-	if (v == SEQ_START_TOKEN)
-		seq_printf(seq,
-			   "  sl  "
-			   "local_address                         "
-			   "remote_address                        "
-			   "st tx_queue rx_queue tr tm->when retrnsmt"
-			   "   uid  timeout inode ref pointer drops\n");
-	else
-		raw6_sock_seq_show(seq, v, raw_seq_private(seq)->bucket);
+	if (v == SEQ_START_TOKEN) {
+		seq_puts(seq, IPV6_SEQ_DGRAM_HEADER);
+	} else {
+		struct sock *sp = v;
+		__u16 srcp  = inet_sk(sp)->inet_num;
+		ip6_dgram_sock_seq_show(seq, v, srcp, 0,
+					raw_seq_private(seq)->bucket);
+	}
 	return 0;
 }
 
